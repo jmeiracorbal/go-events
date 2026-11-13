@@ -80,6 +80,33 @@ jobs:
       - name: Test idempotent release publishing
         run: bash .github/scripts/publish-release-test.sh
 
+  consumer-smoke:
+    name: Verify external module consumption
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.11'
+      - name: Resolve tagged dependency and compile all adapters
+        run: |
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "$workdir"' EXIT
+          cd "$workdir"
+          go mod init example.com/go-events-consumer
+          GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org go get github.com/jmeiracorbal/go-events@v0.1.0
+          cat > main.go <<'EOF'
+          package main
+          import (
+              _ "github.com/jmeiracorbal/go-events"
+              _ "github.com/jmeiracorbal/go-events/adapters/local"
+              _ "github.com/jmeiracorbal/go-events/adapters/nats"
+          )
+          func main() {}
+          EOF
+          go mod tidy
+          go build ./...
+
   compatibility:
     name: Go 1.25 compatibility
     runs-on: ubuntu-latest
