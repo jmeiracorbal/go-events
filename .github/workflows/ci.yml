@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:
@@ -15,22 +16,74 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  test:
+  workflow-lint:
+    name: Validate workflow syntax
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.25.8'
+          go-version: '1.26.11'
+          cache: true
+      - name: Install actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Validate workflows
+        run: actionlint .github/workflows/ci.yml .github/workflows/release.yml
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.11'
           cache: true
       - name: Verify module files
+        if: runner.os == 'Linux'
         run: |
           go mod tidy
           git diff --exit-code -- go.mod go.sum
       - name: Test
         run: go test -count=1 ./...
       - name: Race test
+        if: runner.os == 'Linux'
         run: go test -race -count=1 ./...
       - name: Vet
         run: go vet ./...
+      - name: Build
+        run: go build ./...
+
+  compatibility:
+    name: Go 1.25 compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.14'
+          cache: true
+      - name: Test minimum Go release series
+        run: go test -count=1 ./...
+
+  security:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.11'
+          cache: true
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+      - name: Scan reachable vulnerabilities
+        run: govulncheck -scan symbol ./...

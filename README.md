@@ -50,3 +50,11 @@ The local adapter delivers synchronously in subscription order and returns handl
 ## Tests
 
 `go test ./...` runs local tests and JetStream integration tests against an embedded NATS server.
+
+## Releases
+
+Every pull request and push to `main` runs the same CI. Checks include tests on Linux and macOS, the Linux race detector, `go vet`, compilation, module tidiness and `govulncheck` with Go 1.26.11. Go 1.25.14 is tested separately for compatibility with existing consumers; it is no longer a supported Go security release.
+
+A release is published only when a `vMAJOR.MINOR.PATCH` tag is pushed. The release workflow reruns CI, checks that the tagged commit is part of `main`, and creates a GitHub Release only after all checks pass. Merging a pull request does not automatically publish a version.
+
+This repository is a Go library. Releases are versioned source modules, not executable artifacts.
