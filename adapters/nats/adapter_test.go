@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync/atomic"
+	"strings"
 	"testing"
 	"time"
 
@@ -425,5 +426,91 @@ func TestJetStreamCutoverAfterDrainingUnheaderedDeliveries(t *testing.T) {
 	}
 	if info.NumPending != 0 || info.NumAckPending != 0 {
 		t.Fatalf("cutover left pending deliveries: %+v", info)
+	}
+}
+
+func TestDeliveryWithoutMessageIDIsNeverCommitted(t *testing.T) {
+	url := newServer(t)
+	prepareStream(t, url)
+	nc, err := natsio.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	js, err := nc.JetStream()
+	if err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	legacyData := []byte(`{"id":"unacknowledged-event","type":"execution.started"}`)
+	published, err := js.Publish("work.created", legacyData)
+	if err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	nc.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	reported := make(chan error, 4)
+	var applied atomic.Int32
+	a, err := New(ctx, Config{
+		URL: url, Stream: "EVENTS", Consumer: "unchecked-cutover",
+		AckWait: time.Second, RetryDelay: 100 * time.Millisecond,
+		OnError: func(err error) {
+			select {
+			case reported <- err:
+			default:
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	sub, err := a.Subscribe(ctx, "work.created", func(context.Context, events.Event) error {
+		applied.Add(1)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	select {
+	case err := <-reported:
+		if !strings.Contains(err.Error(), "event ID is required") {
+			t.Fatalf("incorrect error for missing message ID: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("missing message ID did not fail visibly")
+	}
+	if err := sub.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if applied.Load() != 0 {
+		t.Fatalf("unidentified message reached application handler %d times", applied.Load())
+	}
+
+	check, err := natsio.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	checkJS, err := check.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := checkJS.GetMsg("EVENTS", published.Sequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stored.Data) != string(legacyData) || stored.Header.Get(messageIDHeader) != "" {
+		t.Fatal("invalid event was rewritten or deleted")
+	}
+	info, err := checkJS.ConsumerInfo("EVENTS", "unchecked-cutover")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.AckFloor.Stream != 0 {
+		t.Fatalf("invalid event was acknowledged: %+v", info)
 	}
 }
