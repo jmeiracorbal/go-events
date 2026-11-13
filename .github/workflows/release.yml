@@ -57,6 +57,7 @@ jobs:
           )
           func main() {}
           EOF
+          go mod tidy
           go build ./...
 
   publish:
