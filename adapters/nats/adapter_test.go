@@ -2,6 +2,7 @@ package nats
 
 import (
 	"context"
+	"fmt"
 	"errors"
 	"sync/atomic"
 	"testing"
@@ -172,5 +173,131 @@ func TestMissingStreamFails(t *testing.T) {
 	if a, err := New(ctx, Config{URL: url, Stream: "MISSING"}); err == nil {
 		_ = a.Close()
 		t.Fatal("expected missing stream error")
+	}
+}
+
+func TestLegacyUnheaderedEventSurvivesConsumerMigration(t *testing.T) {
+	url := newServer(t)
+	prepareStream(t, url)
+	nc, err := natsio.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := nc.JetStream()
+	if err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	// This is how the pre-migration Mnemo controller created its durable
+	// pull subscription. Its AckWait intentionally differs from the new
+	// adapter configuration to prove that the consumer is not recreated.
+	oldSub, err := legacy.PullSubscribe("work.created", "mnemo-controller", natsio.BindStream("EVENTS"), natsio.AckWait(7*time.Second))
+	if err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	payload := []byte(`{"id":"original-event-id","type":"execution.started","project":"existing"}`)
+	ack, err := legacy.Publish("work.created", payload)
+	if err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	pending, err := oldSub.Fetch(1, natsio.MaxWait(2*time.Second))
+	if err != nil || len(pending) != 1 {
+		nc.Close()
+		t.Fatalf("fetch pre-migration event: count=%d err=%v", len(pending), err)
+	}
+	if len(pending[0].Header) != 0 {
+		nc.Close()
+		t.Fatalf("legacy event unexpectedly has headers: %v", pending[0].Header)
+	}
+	if err := pending[0].NakWithDelay(25 * time.Millisecond); err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	if err := nc.FlushTimeout(2 * time.Second); err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	nc.Close() // Simulate old controller stopping without deleting its durable.
+
+	a := newAdapter(t, url, "mnemo-controller")
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	var attempts atomic.Int32
+	received := make(chan events.Event, 2)
+	sub, err := a.Subscribe(ctx, "work.created", func(_ context.Context, event events.Event) error {
+		received <- event
+		if attempts.Add(1) == 1 {
+			return errors.New("transient storage failure")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	wantID := fmt.Sprintf("jetstream:EVENTS:%d", ack.Sequence)
+	for i := 0; i < 2; i++ {
+		select {
+		case event := <-received:
+			if event.ID != wantID || event.Topic != "work.created" || string(event.Data) != string(payload) {
+				t.Fatalf("legacy event changed on attempt %d: %+v", i+1, event)
+			}
+		case <-ctx.Done():
+			t.Fatal("legacy delivery was not retried with its durable identity")
+		}
+	}
+	// Even while an old consumer is being reused, retain its original
+	// acknowledgement policy, filter, AckWait and durable name.
+	cons, err := a.js.Consumer(ctx, "EVENTS", "mnemo-controller")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := cons.Info(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Config.AckWait != 7*time.Second || info.Config.FilterSubject != "work.created" ||
+		info.Config.AckPolicy != jetstream.AckExplicitPolicy || info.Config.Durable != "mnemo-controller" {
+		t.Fatalf("existing durable consumer was modified: %+v", info.Config)
+	}
+}
+
+func TestExistingConsumerWithDifferentFilterIsNotModified(t *testing.T) {
+	url := newServer(t)
+	prepareStream(t, url)
+	nc, err := natsio.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := nc.JetStream()
+	if err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	if _, err := legacy.PullSubscribe("work.other", "filter-mismatch", natsio.BindStream("EVENTS")); err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	nc.Close()
+
+	a := newAdapter(t, url, "filter-mismatch")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if sub, err := a.Subscribe(ctx, "work.created", func(context.Context, events.Event) error { return nil }); err == nil {
+		_ = sub.Close()
+		t.Fatal("expected incompatible existing consumer to be rejected")
+	}
+	cons, err := a.js.Consumer(ctx, "EVENTS", "filter-mismatch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := cons.Info(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Config.FilterSubject != "work.other" {
+		t.Fatalf("existing consumer filter was modified: %q", info.Config.FilterSubject)
 	}
 }
