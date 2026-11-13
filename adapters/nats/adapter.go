@@ -137,20 +137,40 @@ func (a *Adapter) Subscribe(ctx context.Context, topic string, handler events.Ha
 	}
 	a.mu.Unlock()
 
-	cons, err := a.js.CreateConsumer(ctx, a.cfg.Stream, jetstream.ConsumerConfig{
-		Durable:       a.cfg.Consumer,
-		FilterSubject: topic,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		AckWait:       a.cfg.AckWait,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create durable consumer %q: %w", a.cfg.Consumer, err)
+	// Reattach to an existing durable without rewriting its delivery policy,
+	// acknowledgment settings or progress. Existing installations can have
+	// pending deliveries created by the legacy NATS client.
+	cons, err := a.js.Consumer(ctx, a.cfg.Stream, a.cfg.Consumer)
+	switch {
+	case errors.Is(err, jetstream.ErrConsumerNotFound):
+		cons, err = a.js.CreateConsumer(ctx, a.cfg.Stream, jetstream.ConsumerConfig{
+			Durable:       a.cfg.Consumer,
+			FilterSubject: topic,
+			AckPolicy:     jetstream.AckExplicitPolicy,
+			AckWait:       a.cfg.AckWait,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create durable consumer %q: %w", a.cfg.Consumer, err)
+		}
+	case err != nil:
+		return nil, fmt.Errorf("open durable consumer %q: %w", a.cfg.Consumer, err)
+	default:
+		info, err := cons.Info(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("inspect durable consumer %q: %w", a.cfg.Consumer, err)
+		}
+		if info.Config.FilterSubject != topic || info.Config.AckPolicy != jetstream.AckExplicitPolicy || info.Config.DeliverSubject != "" {
+			return nil, fmt.Errorf("durable consumer %q has an incompatible delivery configuration", a.cfg.Consumer)
+		}
 	}
 	consume, err := cons.Consume(func(msg jetstream.Msg) {
-		event := events.Event{
-			ID:    msg.Headers().Get(messageIDHeader),
-			Topic: msg.Subject(),
-			Data:  append([]byte(nil), msg.Data()...),
+		event, err := deliveredEvent(msg)
+		if err != nil {
+			a.report(fmt.Errorf("identify event delivery: %w", err))
+			if nakErr := msg.NakWithDelay(a.cfg.RetryDelay); nakErr != nil {
+				a.report(fmt.Errorf("reject unidentified delivery: %w", nakErr))
+			}
+			return
 		}
 		if err := event.Validate(); err != nil {
 			a.report(fmt.Errorf("invalid event delivery: %w", err))
@@ -196,6 +216,29 @@ func (a *Adapter) Subscribe(ctx context.Context, topic string, handler events.Ha
 		}
 	}()
 	return s, nil
+}
+
+// deliveredEvent preserves explicit message IDs. Older JetStream producers
+// omitted Nats-Msg-Id; in that case the immutable stream sequence supplies a
+// stable transport identity across redeliveries without examining the payload.
+// Applications remain responsible for interpreting their own event envelopes.
+func deliveredEvent(msg jetstream.Msg) (events.Event, error) {
+	id := msg.Headers().Get(messageIDHeader)
+	if id == "" {
+		meta, err := msg.Metadata()
+		if err != nil {
+			return events.Event{}, fmt.Errorf("read JetStream delivery metadata: %w", err)
+		}
+		if meta == nil || meta.Stream == "" || meta.Sequence.Stream == 0 {
+			return events.Event{}, errors.New("JetStream delivery has no stable stream identity")
+		}
+		id = fmt.Sprintf("jetstream:%s:%d", meta.Stream, meta.Sequence.Stream)
+	}
+	return events.Event{
+		ID:    id,
+		Topic: msg.Subject(),
+		Data:  append([]byte(nil), msg.Data()...),
+	}, nil
 }
 
 func (a *Adapter) report(err error) {
