@@ -137,9 +137,9 @@ func (a *Adapter) Subscribe(ctx context.Context, topic string, handler events.Ha
 	}
 	a.mu.Unlock()
 
-	// Reattach to an existing durable without rewriting its delivery policy,
-	// acknowledgment settings or progress. Existing installations can have
-	// pending deliveries created by the legacy NATS client.
+	// Reuse an existing durable consumer without rewriting its delivery
+	// configuration or progress. Creating a missing consumer is the normal
+	// subscription lifecycle, not a compatibility path.
 	cons, err := a.js.Consumer(ctx, a.cfg.Stream, a.cfg.Consumer)
 	switch {
 	case errors.Is(err, jetstream.ErrConsumerNotFound):
@@ -164,13 +164,10 @@ func (a *Adapter) Subscribe(ctx context.Context, topic string, handler events.Ha
 		}
 	}
 	consume, err := cons.Consume(func(msg jetstream.Msg) {
-		event, err := deliveredEvent(msg)
-		if err != nil {
-			a.report(fmt.Errorf("identify event delivery: %w", err))
-			if nakErr := msg.NakWithDelay(a.cfg.RetryDelay); nakErr != nil {
-				a.report(fmt.Errorf("reject unidentified delivery: %w", nakErr))
-			}
-			return
+		event := events.Event{
+			ID:    msg.Headers().Get(messageIDHeader),
+			Topic: msg.Subject(),
+			Data:  append([]byte(nil), msg.Data()...),
 		}
 		if err := event.Validate(); err != nil {
 			a.report(fmt.Errorf("invalid event delivery: %w", err))
@@ -216,29 +213,6 @@ func (a *Adapter) Subscribe(ctx context.Context, topic string, handler events.Ha
 		}
 	}()
 	return s, nil
-}
-
-// deliveredEvent preserves explicit message IDs. Older JetStream producers
-// omitted Nats-Msg-Id; in that case the immutable stream sequence supplies a
-// stable transport identity across redeliveries without examining the payload.
-// Applications remain responsible for interpreting their own event envelopes.
-func deliveredEvent(msg jetstream.Msg) (events.Event, error) {
-	id := msg.Headers().Get(messageIDHeader)
-	if id == "" {
-		meta, err := msg.Metadata()
-		if err != nil {
-			return events.Event{}, fmt.Errorf("read JetStream delivery metadata: %w", err)
-		}
-		if meta == nil || meta.Stream == "" || meta.Sequence.Stream == 0 {
-			return events.Event{}, errors.New("JetStream delivery has no stable stream identity")
-		}
-		id = fmt.Sprintf("jetstream:%s:%d", meta.Stream, meta.Sequence.Stream)
-	}
-	return events.Event{
-		ID:    id,
-		Topic: msg.Subject(),
-		Data:  append([]byte(nil), msg.Data()...),
-	}, nil
 }
 
 func (a *Adapter) report(err error) {
