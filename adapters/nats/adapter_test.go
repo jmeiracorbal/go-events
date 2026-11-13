@@ -514,3 +514,170 @@ func TestDeliveryWithoutMessageIDIsNeverCommitted(t *testing.T) {
 		t.Fatalf("invalid event was acknowledged: %+v", info)
 	}
 }
+
+func TestDurableCutoverPreservesDiskStateAfterEmbeddedServerRestart(t *testing.T) {
+	storage := t.TempDir()
+	start := func() *natsserver.Server {
+		t.Helper()
+		server, err := natsserver.NewServer(&natsserver.Options{
+			Host: "127.0.0.1", Port: -1, JetStream: true,
+			StoreDir: storage, NoLog: true, NoSigs: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		server.Start()
+		if !server.ReadyForConnections(5 * time.Second) {
+			server.Shutdown()
+			t.Fatal("persistent NATS server did not become ready")
+		}
+		return server
+	}
+	stop := func(server *natsserver.Server) {
+		t.Helper()
+		server.Shutdown()
+		server.WaitForShutdown()
+	}
+
+	// Emulate Mnemo's existing embedded NATS server and exact durable names.
+	originalServer := start()
+	nc, err := natsio.Connect(originalServer.ClientURL())
+	if err != nil {
+		stop(originalServer)
+		t.Fatal(err)
+	}
+	legacy, err := nc.JetStream()
+	if err != nil {
+		nc.Close()
+		stop(originalServer)
+		t.Fatal(err)
+	}
+	if _, err := legacy.AddStream(&natsio.StreamConfig{
+		Name: "MNEMO_EVENTS", Subjects: []string{"mnemo.events.>"},
+		Storage: natsio.FileStorage, Retention: natsio.LimitsPolicy,
+	}); err != nil {
+		nc.Close()
+		stop(originalServer)
+		t.Fatal(err)
+	}
+	oldConsumer, err := legacy.PullSubscribe("mnemo.events.>", "mnemo-controller", natsio.BindStream("MNEMO_EVENTS"))
+	if err != nil {
+		nc.Close()
+		stop(originalServer)
+		t.Fatal(err)
+	}
+	persisted := []byte(`{"id":"pre-upgrade-id","type":"workspace.file_changed","project":"project-x","execution_key":"execution-x","payload":{"path":"main.go","action":"modified"},"occurred_at":"2026-01-01T00:00:00Z"}`)
+	pub, err := legacy.Publish("mnemo.events.project-x", persisted)
+	if err != nil {
+		nc.Close()
+		stop(originalServer)
+		t.Fatal(err)
+	}
+	pending, err := oldConsumer.Fetch(1, natsio.MaxWait(3*time.Second))
+	if err != nil || len(pending) != 1 {
+		nc.Close()
+		stop(originalServer)
+		t.Fatalf("fetch existing delivery: messages=%d err=%v", len(pending), err)
+	}
+	if pending[0].Header.Get(messageIDHeader) != "" || string(pending[0].Data) != string(persisted) {
+		nc.Close()
+		stop(originalServer)
+		t.Fatal("stored old event does not match the original wire format")
+	}
+	if err := pending[0].AckSync(); err != nil {
+		nc.Close()
+		stop(originalServer)
+		t.Fatal(err)
+	}
+	previous, err := legacy.ConsumerInfo("MNEMO_EVENTS", "mnemo-controller")
+	if err != nil {
+		nc.Close()
+		stop(originalServer)
+		t.Fatal(err)
+	}
+	if previous.NumPending != 0 || previous.NumAckPending != 0 || previous.AckFloor.Stream != pub.Sequence {
+		nc.Close()
+		stop(originalServer)
+		t.Fatalf("old controller had uncommitted deliveries: %+v", previous)
+	}
+	nc.Close()
+	stop(originalServer)
+
+	// Restart the entire broker with the *same* file-backed storage directory.
+	// go-events must not create a replacement stream/consumer or replay the
+	// already acknowledged legacy message.
+	restartedServer := start()
+	defer stop(restartedServer)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	a, err := New(ctx, Config{
+		URL: restartedServer.ClientURL(), Stream: "MNEMO_EVENTS",
+		Consumer: "mnemo-controller", AckWait: 2*time.Second,
+		RetryDelay: 25*time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	received := make(chan events.Event, 2)
+	sub, err := a.Subscribe(ctx, "mnemo.events.>", func(_ context.Context, event events.Event) error {
+		received <- event
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	next := []byte(`{"id":"post-upgrade-id","type":"execution.closed","project":"project-x","execution_key":"execution-x","payload":{},"occurred_at":"2026-01-01T00:00:01Z"}`)
+	if err := a.Publish(ctx, events.Event{
+		ID: "post-upgrade-id", Topic: "mnemo.events.project-x", Data: next,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case delivered := <-received:
+		if delivered.ID != "post-upgrade-id" || string(delivered.Data) != string(next) {
+			t.Fatalf("event mutated or previous message replayed: %+v", delivered)
+		}
+	case <-ctx.Done():
+		t.Fatal("post-upgrade delivery was not processed")
+	}
+
+	inspect, err := natsio.Connect(restartedServer.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inspect.Close()
+	inspector, err := inspect.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := inspector.GetMsg("MNEMO_EVENTS", pub.Sequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(original.Data) != string(persisted) || original.Header.Get(messageIDHeader) != "" {
+		t.Fatal("previous event was modified or reencoded during broker restart")
+	}
+	until := time.Now().Add(5 * time.Second)
+	for {
+		info, err := inspector.ConsumerInfo("MNEMO_EVENTS", "mnemo-controller")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.NumPending == 0 && info.NumAckPending == 0 &&
+			info.AckFloor.Stream == pub.Sequence+1 {
+			if info.Config.FilterSubject != "mnemo.events.>" ||
+				info.Config.Durable != previous.Config.Durable ||
+				info.Config.AckPolicy != previous.Config.AckPolicy ||
+				info.Config.AckWait != previous.Config.AckWait {
+				t.Fatalf("durable changed across server restart: %+v", info.Config)
+			}
+			break
+		}
+		if time.Now().After(until) {
+			t.Fatalf("restarted controller has unacknowledged or replayed events: %+v", info)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
