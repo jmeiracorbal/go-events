@@ -190,7 +190,7 @@ func TestExistingDurableConsumerPreservesSettingsAndPendingDelivery(t *testing.T
 	}
 	// Create an ordinary durable subscriber with an AckWait distinct from the
 	// new adapter's configuration. Reattachment must not reset its settings.
-	oldSub, err := js.PullSubscribe("work.created", "persistent-consumer", natsio.BindStream("EVENTS"), natsio.AckWait(7*time.Second))
+	initialSub, err := js.PullSubscribe("work.created", "persistent-consumer", natsio.BindStream("EVENTS"), natsio.AckWait(7*time.Second))
 	if err != nil {
 		nc.Close()
 		t.Fatal(err)
@@ -206,7 +206,7 @@ func TestExistingDurableConsumerPreservesSettingsAndPendingDelivery(t *testing.T
 		nc.Close()
 		t.Fatal(err)
 	}
-	pending, err := oldSub.Fetch(1, natsio.MaxWait(2*time.Second))
+	pending, err := initialSub.Fetch(1, natsio.MaxWait(2*time.Second))
 	if err != nil || len(pending) != 1 {
 		nc.Close()
 		t.Fatalf("fetch pending event: count=%d err=%v", len(pending), err)
@@ -272,12 +272,12 @@ func TestExistingConsumerWithDifferentFilterIsNotModified(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacy, err := nc.JetStream()
+	initialJS, err := nc.JetStream()
 	if err != nil {
 		nc.Close()
 		t.Fatal(err)
 	}
-	if _, err := legacy.PullSubscribe("work.other", "filter-mismatch", natsio.BindStream("EVENTS")); err != nil {
+	if _, err := initialJS.PullSubscribe("work.other", "filter-mismatch", natsio.BindStream("EVENTS")); err != nil {
 		nc.Close()
 		t.Fatal(err)
 	}
@@ -307,19 +307,19 @@ func TestJetStreamHandoverAfterAcknowledgingUnheaderedDeliveries(t *testing.T) {
 	url := newServer(t)
 	prepareStream(t, url)
 
-	// Simulate the existing controller: legacy NATS publishers store the
+	// Simulate the existing controller: initialJS NATS publishers store the
 	// application envelope without Nats-Msg-Id, then its durable consumer
-	// commits and acknowledges every delivery before the controller stops.
+	// acknowledges each delivery before the consumer is replaced.
 	nc, err := natsio.Connect(url)
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldJS, err := nc.JetStream()
+	initialJS, err := nc.JetStream()
 	if err != nil {
 		nc.Close()
 		t.Fatal(err)
 	}
-	oldConsumer, err := oldJS.PullSubscribe("work.created", "existing-controller", natsio.BindStream("EVENTS"))
+	initialConsumer, err := initialJS.PullSubscribe("work.created", "existing-controller", natsio.BindStream("EVENTS"))
 	if err != nil {
 		nc.Close()
 		t.Fatal(err)
@@ -330,14 +330,14 @@ func TestJetStreamHandoverAfterAcknowledgingUnheaderedDeliveries(t *testing.T) {
 	}
 	sequence := make([]uint64, 0, len(original))
 	for _, data := range original {
-		published, err := oldJS.PublishMsg(&natsio.Msg{Subject: "work.created", Data: data})
+		published, err := initialJS.PublishMsg(&natsio.Msg{Subject: "work.created", Data: data})
 		if err != nil {
 			nc.Close()
 			t.Fatal(err)
 		}
 		sequence = append(sequence, published.Sequence)
 	}
-	messages, err := oldConsumer.Fetch(len(original), natsio.MaxWait(3*time.Second))
+	messages, err := initialConsumer.Fetch(len(original), natsio.MaxWait(3*time.Second))
 	if err != nil || len(messages) != len(original) {
 		nc.Close()
 		t.Fatalf("drain existing deliveries: received=%d err=%v", len(messages), err)
@@ -345,21 +345,21 @@ func TestJetStreamHandoverAfterAcknowledgingUnheaderedDeliveries(t *testing.T) {
 	for i, msg := range messages {
 		if msg.Header.Get(messageIDHeader) != "" || string(msg.Data) != string(original[i]) {
 			nc.Close()
-			t.Fatalf("pre-cutover event %d was modified: %+v", i, msg)
+			t.Fatalf("pre-handover event %d was modified: %+v", i, msg)
 		}
 		if err := msg.AckSync(); err != nil {
 			nc.Close()
-			t.Fatalf("ack committed pre-cutover event: %v", err)
+			t.Fatalf("ack committed pre-handover event: %v", err)
 		}
 	}
-	before, err := oldJS.ConsumerInfo("EVENTS", "existing-controller")
+	before, err := initialJS.ConsumerInfo("EVENTS", "existing-controller")
 	if err != nil {
 		nc.Close()
 		t.Fatal(err)
 	}
 	if before.NumPending != 0 || before.NumAckPending != 0 || before.AckFloor.Stream != sequence[len(sequence)-1] {
 		nc.Close()
-		t.Fatalf("controller not drained before cutover: %+v", before)
+		t.Fatalf("consumer not drained before handover: %+v", before)
 	}
 	nc.Close()
 
@@ -383,19 +383,19 @@ func TestJetStreamHandoverAfterAcknowledgingUnheaderedDeliveries(t *testing.T) {
 	select {
 	case event := <-received:
 		if event.ID != "after-3" || event.Topic != "work.created" || string(event.Data) != string(newPayload) {
-			t.Fatalf("cutover changed event identity or payload: %+v", event)
+			t.Fatalf("handover changed event identity or payload: %+v", event)
 		}
 	case <-ctx.Done():
-		t.Fatal("post-cutover event was not delivered")
+		t.Fatal("post-handover event was not delivered")
 	}
 	select {
 	case unexpected := <-received:
-		t.Fatalf("pre-cutover event was incorrectly replayed: %+v", unexpected)
+		t.Fatalf("pre-handover event was incorrectly replayed: %+v", unexpected)
 	case <-time.After(150 * time.Millisecond):
 	}
 
-	// Confirm the historic stream entries remain intact and no new stream or
-	// durable was created to bridge the old and new controller implementations.
+	// Confirm the stored messages remain intact and that the existing durable
+	// retains its identity and delivery state.
 	check, err := natsio.Connect(url)
 	if err != nil {
 		t.Fatal(err)
@@ -411,7 +411,7 @@ func TestJetStreamHandoverAfterAcknowledgingUnheaderedDeliveries(t *testing.T) {
 			t.Fatal(err)
 		}
 		if string(stored.Data) != string(original[i]) || stored.Header.Get(messageIDHeader) != "" {
-			t.Fatalf("original message at stream sequence %d was rewritten", seq)
+			t.Fatalf("stored message at stream sequence %d was rewritten", seq)
 		}
 	}
 	info, err := checkJS.ConsumerInfo("EVENTS", "existing-controller")
@@ -422,10 +422,10 @@ func TestJetStreamHandoverAfterAcknowledgingUnheaderedDeliveries(t *testing.T) {
 		info.Config.FilterSubject != before.Config.FilterSubject ||
 		info.Config.AckPolicy != before.Config.AckPolicy ||
 		info.Config.AckWait != before.Config.AckWait {
-		t.Fatalf("cutover modified the durable consumer: before=%+v after=%+v", before.Config, info.Config)
+		t.Fatalf("handover modified the durable consumer: before=%+v after=%+v", before.Config, info.Config)
 	}
 	if info.NumPending != 0 || info.NumAckPending != 0 {
-		t.Fatalf("cutover left pending deliveries: %+v", info)
+		t.Fatalf("handover left pending deliveries: %+v", info)
 	}
 }
 
@@ -441,8 +441,8 @@ func TestDeliveryWithoutMessageIDIsNeverCommitted(t *testing.T) {
 		nc.Close()
 		t.Fatal(err)
 	}
-	legacyData := []byte(`{"id":"unacknowledged-event","type":"record.created"}`)
-	published, err := js.Publish("work.created", legacyData)
+	headerlessPayload := []byte(`{"id":"unacknowledged-event","type":"record.created"}`)
+	published, err := js.Publish("work.created", headerlessPayload)
 	if err != nil {
 		nc.Close()
 		t.Fatal(err)
@@ -503,7 +503,7 @@ func TestDeliveryWithoutMessageIDIsNeverCommitted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(stored.Data) != string(legacyData) || stored.Header.Get(messageIDHeader) != "" {
+	if string(stored.Data) != string(headerlessPayload) || stored.Header.Get(messageIDHeader) != "" {
 		t.Fatal("invalid event was rewritten or deleted")
 	}
 	info, err := checkJS.ConsumerInfo("EVENTS", "unchecked-cutover")
@@ -546,13 +546,13 @@ func TestDurableConsumerPreservesDiskStateAfterServerRestart(t *testing.T) {
 		stop(originalServer)
 		t.Fatal(err)
 	}
-	legacy, err := nc.JetStream()
+	initialJS, err := nc.JetStream()
 	if err != nil {
 		nc.Close()
 		stop(originalServer)
 		t.Fatal(err)
 	}
-	if _, err := legacy.AddStream(&natsio.StreamConfig{
+	if _, err := initialJS.AddStream(&natsio.StreamConfig{
 		Name: "RESTART_EVENTS", Subjects: []string{"audit.events.>"},
 		Storage: natsio.FileStorage, Retention: natsio.LimitsPolicy,
 	}); err != nil {
@@ -560,20 +560,20 @@ func TestDurableConsumerPreservesDiskStateAfterServerRestart(t *testing.T) {
 		stop(originalServer)
 		t.Fatal(err)
 	}
-	oldConsumer, err := legacy.PullSubscribe("audit.events.>", "audit-consumer", natsio.BindStream("RESTART_EVENTS"))
+	initialConsumer, err := initialJS.PullSubscribe("audit.events.>", "audit-consumer", natsio.BindStream("RESTART_EVENTS"))
 	if err != nil {
 		nc.Close()
 		stop(originalServer)
 		t.Fatal(err)
 	}
 	persisted := []byte(`{"id":"before-restart-id","type":"record.created","payload":{"name":"sample"},"occurred_at":"2026-01-01T00:00:00Z"}`)
-	pub, err := legacy.Publish("audit.events.source-a", persisted)
+	pub, err := initialJS.Publish("audit.events.source-a", persisted)
 	if err != nil {
 		nc.Close()
 		stop(originalServer)
 		t.Fatal(err)
 	}
-	pending, err := oldConsumer.Fetch(1, natsio.MaxWait(3*time.Second))
+	pending, err := initialConsumer.Fetch(1, natsio.MaxWait(3*time.Second))
 	if err != nil || len(pending) != 1 {
 		nc.Close()
 		stop(originalServer)
@@ -582,14 +582,14 @@ func TestDurableConsumerPreservesDiskStateAfterServerRestart(t *testing.T) {
 	if pending[0].Header.Get(messageIDHeader) != "" || string(pending[0].Data) != string(persisted) {
 		nc.Close()
 		stop(originalServer)
-		t.Fatal("stored old event does not match the original wire format")
+		t.Fatal("stored message does not match its original wire format")
 	}
 	if err := pending[0].AckSync(); err != nil {
 		nc.Close()
 		stop(originalServer)
 		t.Fatal(err)
 	}
-	previous, err := legacy.ConsumerInfo("RESTART_EVENTS", "audit-consumer")
+	previous, err := initialJS.ConsumerInfo("RESTART_EVENTS", "audit-consumer")
 	if err != nil {
 		nc.Close()
 		stop(originalServer)
@@ -598,7 +598,7 @@ func TestDurableConsumerPreservesDiskStateAfterServerRestart(t *testing.T) {
 	if previous.NumPending != 0 || previous.NumAckPending != 0 || previous.AckFloor.Stream != pub.Sequence {
 		nc.Close()
 		stop(originalServer)
-		t.Fatalf("old controller had uncommitted deliveries: %+v", previous)
+		t.Fatalf("initial consumer has uncommitted deliveries: %+v", previous)
 	}
 	nc.Close()
 	stop(originalServer)
@@ -639,7 +639,7 @@ func TestDurableConsumerPreservesDiskStateAfterServerRestart(t *testing.T) {
 			t.Fatalf("event mutated or previous message replayed: %+v", delivered)
 		}
 	case <-ctx.Done():
-		t.Fatal("post-upgrade delivery was not processed")
+		t.Fatal("delivery after broker restart was not processed")
 	}
 
 	inspect, err := natsio.Connect(restartedServer.ClientURL())

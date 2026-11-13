@@ -85,16 +85,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
       - uses: actions/setup-go@v6
         with:
           go-version: '1.26.11'
-      - name: Resolve tagged dependency and compile all adapters
+          cache: true
+      - name: Compile current revision from an external consumer module
         run: |
           workdir="$(mktemp -d)"
           trap 'rm -rf "$workdir"' EXIT
           cd "$workdir"
           go mod init example.com/go-events-consumer
-          GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org go get github.com/jmeiracorbal/go-events@v0.1.0
+          go mod edit -require=github.com/jmeiracorbal/go-events@v0.0.0
+          go mod edit -replace=github.com/jmeiracorbal/go-events="$GITHUB_WORKSPACE"
           cat > main.go <<'EOF'
           package main
           import (

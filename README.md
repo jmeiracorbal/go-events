@@ -55,6 +55,6 @@ The local adapter delivers synchronously in subscription order and returns handl
 
 Every pull request and push to `main` runs the same CI. Checks include tests on Linux and macOS, the Linux race detector, `go vet`, compilation, module tidiness and `govulncheck` with Go 1.26.11. Go 1.25.14 is tested separately for compatibility with existing consumers; it is no longer a supported Go security release.
 
-A release is published only when a `vMAJOR.MINOR.PATCH` tag is pushed. The release workflow reruns CI, checks that the tagged commit is part of `main`, and creates a GitHub Release only after all checks pass. Merging a pull request does not automatically publish a version.
+A release workflow runs when a `vMAJOR.MINOR.PATCH` tag is pushed, or it can be started manually from `main` with an existing tag using the workflow's `tag` input. It validates the tagged revision, checks that the tag belongs to the history of `main`, and verifies that the tagged Go module resolves from the public proxy before publishing. Publication is idempotent: an existing GitHub Release is verified rather than created again. Merging a pull request does not automatically publish a version.
 
 This repository is a Go library. Releases are versioned source modules, not executable artifacts.
