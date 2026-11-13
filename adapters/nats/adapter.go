@@ -137,14 +137,31 @@ func (a *Adapter) Subscribe(ctx context.Context, topic string, handler events.Ha
 	}
 	a.mu.Unlock()
 
-	cons, err := a.js.CreateConsumer(ctx, a.cfg.Stream, jetstream.ConsumerConfig{
-		Durable:       a.cfg.Consumer,
-		FilterSubject: topic,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		AckWait:       a.cfg.AckWait,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create durable consumer %q: %w", a.cfg.Consumer, err)
+	// Reuse an existing durable consumer without rewriting its delivery
+	// configuration or progress. Creating a missing consumer is the normal
+	// subscription lifecycle, not a compatibility path.
+	cons, err := a.js.Consumer(ctx, a.cfg.Stream, a.cfg.Consumer)
+	switch {
+	case errors.Is(err, jetstream.ErrConsumerNotFound):
+		cons, err = a.js.CreateConsumer(ctx, a.cfg.Stream, jetstream.ConsumerConfig{
+			Durable:       a.cfg.Consumer,
+			FilterSubject: topic,
+			AckPolicy:     jetstream.AckExplicitPolicy,
+			AckWait:       a.cfg.AckWait,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create durable consumer %q: %w", a.cfg.Consumer, err)
+		}
+	case err != nil:
+		return nil, fmt.Errorf("open durable consumer %q: %w", a.cfg.Consumer, err)
+	default:
+		info, err := cons.Info(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("inspect durable consumer %q: %w", a.cfg.Consumer, err)
+		}
+		if info.Config.FilterSubject != topic || info.Config.AckPolicy != jetstream.AckExplicitPolicy || info.Config.DeliverSubject != "" {
+			return nil, fmt.Errorf("durable consumer %q has an incompatible delivery configuration", a.cfg.Consumer)
+		}
 	}
 	consume, err := cons.Consume(func(msg jetstream.Msg) {
 		event := events.Event{

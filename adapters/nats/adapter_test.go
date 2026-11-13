@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync/atomic"
+	"strings"
 	"testing"
 	"time"
 
@@ -172,5 +173,511 @@ func TestMissingStreamFails(t *testing.T) {
 	if a, err := New(ctx, Config{URL: url, Stream: "MISSING"}); err == nil {
 		_ = a.Close()
 		t.Fatal("expected missing stream error")
+	}
+}
+
+func TestExistingDurableConsumerPreservesSettingsAndPendingDelivery(t *testing.T) {
+	url := newServer(t)
+	prepareStream(t, url)
+	nc, err := natsio.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	js, err := nc.JetStream()
+	if err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	// Create an ordinary durable subscriber with an AckWait distinct from the
+	// new adapter's configuration. Reattachment must not reset its settings.
+	oldSub, err := js.PullSubscribe("work.created", "persistent-consumer", natsio.BindStream("EVENTS"), natsio.AckWait(7*time.Second))
+	if err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	payload := []byte(`{"id":"persisted-event","project":"existing"}`)
+	msg := &natsio.Msg{
+		Subject: "work.created",
+		Data:    payload,
+		Header:  natsio.Header{},
+	}
+	msg.Header.Set(messageIDHeader, "persisted-event")
+	if _, err := js.PublishMsg(msg); err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	pending, err := oldSub.Fetch(1, natsio.MaxWait(2*time.Second))
+	if err != nil || len(pending) != 1 {
+		nc.Close()
+		t.Fatalf("fetch pending event: count=%d err=%v", len(pending), err)
+	}
+	if pending[0].Header.Get(messageIDHeader) != "persisted-event" {
+		nc.Close()
+		t.Fatal("persisted event does not satisfy the message ID contract")
+	}
+	if err := pending[0].NakWithDelay(25 * time.Millisecond); err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	if err := nc.FlushTimeout(2 * time.Second); err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	nc.Close()
+
+	a := newAdapter(t, url, "persistent-consumer")
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	var attempts atomic.Int32
+	received := make(chan events.Event, 2)
+	sub, err := a.Subscribe(ctx, "work.created", func(_ context.Context, event events.Event) error {
+		received <- event
+		if attempts.Add(1) == 1 {
+			return errors.New("transient storage failure")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	for i := 0; i < 2; i++ {
+		select {
+		case event := <-received:
+			if event.ID != "persisted-event" || event.Topic != "work.created" || string(event.Data) != string(payload) {
+				t.Fatalf("pending delivery changed on attempt %d: %+v", i+1, event)
+			}
+		case <-ctx.Done():
+			t.Fatal("pending delivery was not retried with its original event identity")
+		}
+	}
+	cons, err := a.js.Consumer(ctx, "EVENTS", "persistent-consumer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := cons.Info(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Config.AckWait != 7*time.Second || info.Config.FilterSubject != "work.created" ||
+		info.Config.AckPolicy != jetstream.AckExplicitPolicy || info.Config.Durable != "persistent-consumer" {
+		t.Fatalf("existing durable consumer was modified: %+v", info.Config)
+	}
+}
+
+func TestExistingConsumerWithDifferentFilterIsNotModified(t *testing.T) {
+	url := newServer(t)
+	prepareStream(t, url)
+	nc, err := natsio.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := nc.JetStream()
+	if err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	if _, err := legacy.PullSubscribe("work.other", "filter-mismatch", natsio.BindStream("EVENTS")); err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	nc.Close()
+
+	a := newAdapter(t, url, "filter-mismatch")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if sub, err := a.Subscribe(ctx, "work.created", func(context.Context, events.Event) error { return nil }); err == nil {
+		_ = sub.Close()
+		t.Fatal("expected incompatible existing consumer to be rejected")
+	}
+	cons, err := a.js.Consumer(ctx, "EVENTS", "filter-mismatch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := cons.Info(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Config.FilterSubject != "work.other" {
+		t.Fatalf("existing consumer filter was modified: %q", info.Config.FilterSubject)
+	}
+}
+
+func TestJetStreamCutoverAfterDrainingUnheaderedDeliveries(t *testing.T) {
+	url := newServer(t)
+	prepareStream(t, url)
+
+	// Simulate the existing controller: legacy NATS publishers store the
+	// application envelope without Nats-Msg-Id, then its durable consumer
+	// commits and acknowledges every delivery before the controller stops.
+	nc, err := natsio.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldJS, err := nc.JetStream()
+	if err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	oldConsumer, err := oldJS.PullSubscribe("work.created", "existing-controller", natsio.BindStream("EVENTS"))
+	if err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	original := [][]byte{
+		[]byte(`{"id":"before-1","type":"execution.started","payload":{"directory":"/tmp/project"}}`),
+		[]byte(`{"id":"before-2","type":"workspace.file_changed","payload":{"path":"file.go"}}`),
+	}
+	sequence := make([]uint64, 0, len(original))
+	for _, data := range original {
+		published, err := oldJS.PublishMsg(&natsio.Msg{Subject: "work.created", Data: data})
+		if err != nil {
+			nc.Close()
+			t.Fatal(err)
+		}
+		sequence = append(sequence, published.Sequence)
+	}
+	messages, err := oldConsumer.Fetch(len(original), natsio.MaxWait(3*time.Second))
+	if err != nil || len(messages) != len(original) {
+		nc.Close()
+		t.Fatalf("drain existing deliveries: received=%d err=%v", len(messages), err)
+	}
+	for i, msg := range messages {
+		if msg.Header.Get(messageIDHeader) != "" || string(msg.Data) != string(original[i]) {
+			nc.Close()
+			t.Fatalf("pre-cutover event %d was modified: %+v", i, msg)
+		}
+		if err := msg.AckSync(); err != nil {
+			nc.Close()
+			t.Fatalf("ack committed pre-cutover event: %v", err)
+		}
+	}
+	before, err := oldJS.ConsumerInfo("EVENTS", "existing-controller")
+	if err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	if before.NumPending != 0 || before.NumAckPending != 0 || before.AckFloor.Stream != sequence[len(sequence)-1] {
+		nc.Close()
+		t.Fatalf("controller not drained before cutover: %+v", before)
+	}
+	nc.Close()
+
+	// Reuse the exact same persisted stream and durable with the new adapter.
+	a := newAdapter(t, url, "existing-controller")
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	received := make(chan events.Event, 3)
+	sub, err := a.Subscribe(ctx, "work.created", func(_ context.Context, event events.Event) error {
+		received <- event
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	newPayload := []byte(`{"id":"after-3","type":"execution.closed","payload":{}}`)
+	if err := a.Publish(ctx, events.Event{ID: "after-3", Topic: "work.created", Data: newPayload}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-received:
+		if event.ID != "after-3" || event.Topic != "work.created" || string(event.Data) != string(newPayload) {
+			t.Fatalf("cutover changed event identity or payload: %+v", event)
+		}
+	case <-ctx.Done():
+		t.Fatal("post-cutover event was not delivered")
+	}
+	select {
+	case unexpected := <-received:
+		t.Fatalf("pre-cutover event was incorrectly replayed: %+v", unexpected)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// Confirm the historic stream entries remain intact and no new stream or
+	// durable was created to bridge the old and new controller implementations.
+	check, err := natsio.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	checkJS, err := check.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, seq := range sequence {
+		stored, err := checkJS.GetMsg("EVENTS", seq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(stored.Data) != string(original[i]) || stored.Header.Get(messageIDHeader) != "" {
+			t.Fatalf("original message at stream sequence %d was rewritten", seq)
+		}
+	}
+	info, err := checkJS.ConsumerInfo("EVENTS", "existing-controller")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Config.Durable != before.Config.Durable ||
+		info.Config.FilterSubject != before.Config.FilterSubject ||
+		info.Config.AckPolicy != before.Config.AckPolicy ||
+		info.Config.AckWait != before.Config.AckWait {
+		t.Fatalf("cutover modified the durable consumer: before=%+v after=%+v", before.Config, info.Config)
+	}
+	if info.NumPending != 0 || info.NumAckPending != 0 {
+		t.Fatalf("cutover left pending deliveries: %+v", info)
+	}
+}
+
+func TestDeliveryWithoutMessageIDIsNeverCommitted(t *testing.T) {
+	url := newServer(t)
+	prepareStream(t, url)
+	nc, err := natsio.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	js, err := nc.JetStream()
+	if err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	legacyData := []byte(`{"id":"unacknowledged-event","type":"execution.started"}`)
+	published, err := js.Publish("work.created", legacyData)
+	if err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	nc.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	reported := make(chan error, 4)
+	var applied atomic.Int32
+	a, err := New(ctx, Config{
+		URL: url, Stream: "EVENTS", Consumer: "unchecked-cutover",
+		AckWait: time.Second, RetryDelay: 100 * time.Millisecond,
+		OnError: func(err error) {
+			select {
+			case reported <- err:
+			default:
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	sub, err := a.Subscribe(ctx, "work.created", func(context.Context, events.Event) error {
+		applied.Add(1)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	select {
+	case err := <-reported:
+		if !strings.Contains(err.Error(), "event ID is required") {
+			t.Fatalf("incorrect error for missing message ID: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("missing message ID did not fail visibly")
+	}
+	if err := sub.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if applied.Load() != 0 {
+		t.Fatalf("unidentified message reached application handler %d times", applied.Load())
+	}
+
+	check, err := natsio.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	checkJS, err := check.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := checkJS.GetMsg("EVENTS", published.Sequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stored.Data) != string(legacyData) || stored.Header.Get(messageIDHeader) != "" {
+		t.Fatal("invalid event was rewritten or deleted")
+	}
+	info, err := checkJS.ConsumerInfo("EVENTS", "unchecked-cutover")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.AckFloor.Stream != 0 {
+		t.Fatalf("invalid event was acknowledged: %+v", info)
+	}
+}
+
+func TestDurableCutoverPreservesDiskStateAfterEmbeddedServerRestart(t *testing.T) {
+	storage := t.TempDir()
+	start := func() *natsserver.Server {
+		t.Helper()
+		server, err := natsserver.NewServer(&natsserver.Options{
+			Host: "127.0.0.1", Port: -1, JetStream: true,
+			StoreDir: storage, NoLog: true, NoSigs: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		server.Start()
+		if !server.ReadyForConnections(5 * time.Second) {
+			server.Shutdown()
+			t.Fatal("persistent NATS server did not become ready")
+		}
+		return server
+	}
+	stop := func(server *natsserver.Server) {
+		t.Helper()
+		server.Shutdown()
+		server.WaitForShutdown()
+	}
+
+	// Emulate Mnemo's existing embedded NATS server and exact durable names.
+	originalServer := start()
+	nc, err := natsio.Connect(originalServer.ClientURL())
+	if err != nil {
+		stop(originalServer)
+		t.Fatal(err)
+	}
+	legacy, err := nc.JetStream()
+	if err != nil {
+		nc.Close()
+		stop(originalServer)
+		t.Fatal(err)
+	}
+	if _, err := legacy.AddStream(&natsio.StreamConfig{
+		Name: "MNEMO_EVENTS", Subjects: []string{"mnemo.events.>"},
+		Storage: natsio.FileStorage, Retention: natsio.LimitsPolicy,
+	}); err != nil {
+		nc.Close()
+		stop(originalServer)
+		t.Fatal(err)
+	}
+	oldConsumer, err := legacy.PullSubscribe("mnemo.events.>", "mnemo-controller", natsio.BindStream("MNEMO_EVENTS"))
+	if err != nil {
+		nc.Close()
+		stop(originalServer)
+		t.Fatal(err)
+	}
+	persisted := []byte(`{"id":"pre-upgrade-id","type":"workspace.file_changed","project":"project-x","execution_key":"execution-x","payload":{"path":"main.go","action":"modified"},"occurred_at":"2026-01-01T00:00:00Z"}`)
+	pub, err := legacy.Publish("mnemo.events.project-x", persisted)
+	if err != nil {
+		nc.Close()
+		stop(originalServer)
+		t.Fatal(err)
+	}
+	pending, err := oldConsumer.Fetch(1, natsio.MaxWait(3*time.Second))
+	if err != nil || len(pending) != 1 {
+		nc.Close()
+		stop(originalServer)
+		t.Fatalf("fetch existing delivery: messages=%d err=%v", len(pending), err)
+	}
+	if pending[0].Header.Get(messageIDHeader) != "" || string(pending[0].Data) != string(persisted) {
+		nc.Close()
+		stop(originalServer)
+		t.Fatal("stored old event does not match the original wire format")
+	}
+	if err := pending[0].AckSync(); err != nil {
+		nc.Close()
+		stop(originalServer)
+		t.Fatal(err)
+	}
+	previous, err := legacy.ConsumerInfo("MNEMO_EVENTS", "mnemo-controller")
+	if err != nil {
+		nc.Close()
+		stop(originalServer)
+		t.Fatal(err)
+	}
+	if previous.NumPending != 0 || previous.NumAckPending != 0 || previous.AckFloor.Stream != pub.Sequence {
+		nc.Close()
+		stop(originalServer)
+		t.Fatalf("old controller had uncommitted deliveries: %+v", previous)
+	}
+	nc.Close()
+	stop(originalServer)
+
+	// Restart the entire broker with the *same* file-backed storage directory.
+	// go-events must not create a replacement stream/consumer or replay the
+	// already acknowledged legacy message.
+	restartedServer := start()
+	defer stop(restartedServer)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	a, err := New(ctx, Config{
+		URL: restartedServer.ClientURL(), Stream: "MNEMO_EVENTS",
+		Consumer: "mnemo-controller", AckWait: 2*time.Second,
+		RetryDelay: 25*time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	received := make(chan events.Event, 2)
+	sub, err := a.Subscribe(ctx, "mnemo.events.>", func(_ context.Context, event events.Event) error {
+		received <- event
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	next := []byte(`{"id":"post-upgrade-id","type":"execution.closed","project":"project-x","execution_key":"execution-x","payload":{},"occurred_at":"2026-01-01T00:00:01Z"}`)
+	if err := a.Publish(ctx, events.Event{
+		ID: "post-upgrade-id", Topic: "mnemo.events.project-x", Data: next,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case delivered := <-received:
+		if delivered.ID != "post-upgrade-id" || string(delivered.Data) != string(next) {
+			t.Fatalf("event mutated or previous message replayed: %+v", delivered)
+		}
+	case <-ctx.Done():
+		t.Fatal("post-upgrade delivery was not processed")
+	}
+
+	inspect, err := natsio.Connect(restartedServer.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inspect.Close()
+	inspector, err := inspect.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := inspector.GetMsg("MNEMO_EVENTS", pub.Sequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(original.Data) != string(persisted) || original.Header.Get(messageIDHeader) != "" {
+		t.Fatal("previous event was modified or reencoded during broker restart")
+	}
+	until := time.Now().Add(5 * time.Second)
+	for {
+		info, err := inspector.ConsumerInfo("MNEMO_EVENTS", "mnemo-controller")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.NumPending == 0 && info.NumAckPending == 0 &&
+			info.AckFloor.Stream == pub.Sequence+1 {
+			if info.Config.FilterSubject != "mnemo.events.>" ||
+				info.Config.Durable != previous.Config.Durable ||
+				info.Config.AckPolicy != previous.Config.AckPolicy ||
+				info.Config.AckWait != previous.Config.AckWait {
+				t.Fatalf("durable changed across server restart: %+v", info.Config)
+			}
+			break
+		}
+		if time.Now().After(until) {
+			t.Fatalf("restarted controller has unacknowledged or replayed events: %+v", info)
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 }
