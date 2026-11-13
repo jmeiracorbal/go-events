@@ -301,3 +301,129 @@ func TestExistingConsumerWithDifferentFilterIsNotModified(t *testing.T) {
 		t.Fatalf("existing consumer filter was modified: %q", info.Config.FilterSubject)
 	}
 }
+
+func TestJetStreamCutoverAfterDrainingUnheaderedDeliveries(t *testing.T) {
+	url := newServer(t)
+	prepareStream(t, url)
+
+	// Simulate the existing controller: legacy NATS publishers store the
+	// application envelope without Nats-Msg-Id, then its durable consumer
+	// commits and acknowledges every delivery before the controller stops.
+	nc, err := natsio.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldJS, err := nc.JetStream()
+	if err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	oldConsumer, err := oldJS.PullSubscribe("work.created", "existing-controller", natsio.BindStream("EVENTS"))
+	if err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	original := [][]byte{
+		[]byte(`{"id":"before-1","type":"execution.started","payload":{"directory":"/tmp/project"}}`),
+		[]byte(`{"id":"before-2","type":"workspace.file_changed","payload":{"path":"file.go"}}`),
+	}
+	sequence := make([]uint64, 0, len(original))
+	for _, data := range original {
+		published, err := oldJS.PublishMsg(&natsio.Msg{Subject: "work.created", Data: data})
+		if err != nil {
+			nc.Close()
+			t.Fatal(err)
+		}
+		sequence = append(sequence, published.Sequence)
+	}
+	messages, err := oldConsumer.Fetch(len(original), natsio.MaxWait(3*time.Second))
+	if err != nil || len(messages) != len(original) {
+		nc.Close()
+		t.Fatalf("drain existing deliveries: received=%d err=%v", len(messages), err)
+	}
+	for i, msg := range messages {
+		if msg.Header.Get(messageIDHeader) != "" || string(msg.Data) != string(original[i]) {
+			nc.Close()
+			t.Fatalf("pre-cutover event %d was modified: %+v", i, msg)
+		}
+		if err := msg.AckSync(); err != nil {
+			nc.Close()
+			t.Fatalf("ack committed pre-cutover event: %v", err)
+		}
+	}
+	before, err := oldJS.ConsumerInfo("EVENTS", "existing-controller")
+	if err != nil {
+		nc.Close()
+		t.Fatal(err)
+	}
+	if before.NumPending != 0 || before.NumAckPending != 0 || before.AckFloor.Stream != sequence[len(sequence)-1] {
+		nc.Close()
+		t.Fatalf("controller not drained before cutover: %+v", before)
+	}
+	nc.Close()
+
+	// Reuse the exact same persisted stream and durable with the new adapter.
+	a := newAdapter(t, url, "existing-controller")
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	received := make(chan events.Event, 3)
+	sub, err := a.Subscribe(ctx, "work.created", func(_ context.Context, event events.Event) error {
+		received <- event
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	newPayload := []byte(`{"id":"after-3","type":"execution.closed","payload":{}}`)
+	if err := a.Publish(ctx, events.Event{ID: "after-3", Topic: "work.created", Data: newPayload}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-received:
+		if event.ID != "after-3" || event.Topic != "work.created" || string(event.Data) != string(newPayload) {
+			t.Fatalf("cutover changed event identity or payload: %+v", event)
+		}
+	case <-ctx.Done():
+		t.Fatal("post-cutover event was not delivered")
+	}
+	select {
+	case unexpected := <-received:
+		t.Fatalf("pre-cutover event was incorrectly replayed: %+v", unexpected)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// Confirm the historic stream entries remain intact and no new stream or
+	// durable was created to bridge the old and new controller implementations.
+	check, err := natsio.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	checkJS, err := check.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, seq := range sequence {
+		stored, err := checkJS.GetMsg("EVENTS", seq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(stored.Data) != string(original[i]) || stored.Header.Get(messageIDHeader) != "" {
+			t.Fatalf("original message at stream sequence %d was rewritten", seq)
+		}
+	}
+	info, err := checkJS.ConsumerInfo("EVENTS", "existing-controller")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Config.Durable != before.Config.Durable ||
+		info.Config.FilterSubject != before.Config.FilterSubject ||
+		info.Config.AckPolicy != before.Config.AckPolicy ||
+		info.Config.AckWait != before.Config.AckWait {
+		t.Fatalf("cutover modified the durable consumer: before=%+v after=%+v", before.Config, info.Config)
+	}
+	if info.NumPending != 0 || info.NumAckPending != 0 {
+		t.Fatalf("cutover left pending deliveries: %+v", info)
+	}
+}
