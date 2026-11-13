@@ -303,7 +303,7 @@ func TestExistingConsumerWithDifferentFilterIsNotModified(t *testing.T) {
 	}
 }
 
-func TestJetStreamCutoverAfterDrainingUnheaderedDeliveries(t *testing.T) {
+func TestJetStreamHandoverAfterAcknowledgingUnheaderedDeliveries(t *testing.T) {
 	url := newServer(t)
 	prepareStream(t, url)
 
@@ -325,8 +325,8 @@ func TestJetStreamCutoverAfterDrainingUnheaderedDeliveries(t *testing.T) {
 		t.Fatal(err)
 	}
 	original := [][]byte{
-		[]byte(`{"id":"before-1","type":"execution.started","payload":{"directory":"/tmp/project"}}`),
-		[]byte(`{"id":"before-2","type":"workspace.file_changed","payload":{"path":"file.go"}}`),
+		[]byte(`{"id":"before-1","type":"record.created","payload":{"name":"sample"}}`),
+		[]byte(`{"id":"before-2","type":"record.updated","payload":{"name":"sample"}}`),
 	}
 	sequence := make([]uint64, 0, len(original))
 	for _, data := range original {
@@ -376,7 +376,7 @@ func TestJetStreamCutoverAfterDrainingUnheaderedDeliveries(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sub.Close()
-	newPayload := []byte(`{"id":"after-3","type":"execution.closed","payload":{}}`)
+	newPayload := []byte(`{"id":"after-3","type":"record.closed","payload":{}}`)
 	if err := a.Publish(ctx, events.Event{ID: "after-3", Topic: "work.created", Data: newPayload}); err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +441,7 @@ func TestDeliveryWithoutMessageIDIsNeverCommitted(t *testing.T) {
 		nc.Close()
 		t.Fatal(err)
 	}
-	legacyData := []byte(`{"id":"unacknowledged-event","type":"execution.started"}`)
+	legacyData := []byte(`{"id":"unacknowledged-event","type":"record.created"}`)
 	published, err := js.Publish("work.created", legacyData)
 	if err != nil {
 		nc.Close()
@@ -515,7 +515,7 @@ func TestDeliveryWithoutMessageIDIsNeverCommitted(t *testing.T) {
 	}
 }
 
-func TestDurableCutoverPreservesDiskStateAfterEmbeddedServerRestart(t *testing.T) {
+func TestDurableConsumerPreservesDiskStateAfterServerRestart(t *testing.T) {
 	storage := t.TempDir()
 	start := func() *natsserver.Server {
 		t.Helper()
@@ -539,7 +539,7 @@ func TestDurableCutoverPreservesDiskStateAfterEmbeddedServerRestart(t *testing.T
 		server.WaitForShutdown()
 	}
 
-	// Emulate Mnemo's existing embedded NATS server and exact durable names.
+	// Create a file-backed JetStream stream and durable consumer that must survive a server restart.
 	originalServer := start()
 	nc, err := natsio.Connect(originalServer.ClientURL())
 	if err != nil {
@@ -553,21 +553,21 @@ func TestDurableCutoverPreservesDiskStateAfterEmbeddedServerRestart(t *testing.T
 		t.Fatal(err)
 	}
 	if _, err := legacy.AddStream(&natsio.StreamConfig{
-		Name: "MNEMO_EVENTS", Subjects: []string{"mnemo.events.>"},
+		Name: "RESTART_EVENTS", Subjects: []string{"audit.events.>"},
 		Storage: natsio.FileStorage, Retention: natsio.LimitsPolicy,
 	}); err != nil {
 		nc.Close()
 		stop(originalServer)
 		t.Fatal(err)
 	}
-	oldConsumer, err := legacy.PullSubscribe("mnemo.events.>", "mnemo-controller", natsio.BindStream("MNEMO_EVENTS"))
+	oldConsumer, err := legacy.PullSubscribe("audit.events.>", "audit-consumer", natsio.BindStream("RESTART_EVENTS"))
 	if err != nil {
 		nc.Close()
 		stop(originalServer)
 		t.Fatal(err)
 	}
-	persisted := []byte(`{"id":"pre-upgrade-id","type":"workspace.file_changed","project":"project-x","execution_key":"execution-x","payload":{"path":"main.go","action":"modified"},"occurred_at":"2026-01-01T00:00:00Z"}`)
-	pub, err := legacy.Publish("mnemo.events.project-x", persisted)
+	persisted := []byte(`{"id":"before-restart-id","type":"record.created","payload":{"name":"sample"},"occurred_at":"2026-01-01T00:00:00Z"}`)
+	pub, err := legacy.Publish("audit.events.source-a", persisted)
 	if err != nil {
 		nc.Close()
 		stop(originalServer)
@@ -589,7 +589,7 @@ func TestDurableCutoverPreservesDiskStateAfterEmbeddedServerRestart(t *testing.T
 		stop(originalServer)
 		t.Fatal(err)
 	}
-	previous, err := legacy.ConsumerInfo("MNEMO_EVENTS", "mnemo-controller")
+	previous, err := legacy.ConsumerInfo("RESTART_EVENTS", "audit-consumer")
 	if err != nil {
 		nc.Close()
 		stop(originalServer)
@@ -603,16 +603,15 @@ func TestDurableCutoverPreservesDiskStateAfterEmbeddedServerRestart(t *testing.T
 	nc.Close()
 	stop(originalServer)
 
-	// Restart the entire broker with the *same* file-backed storage directory.
-	// go-events must not create a replacement stream/consumer or replay the
-	// already acknowledged legacy message.
+	// Restart the broker using the same file-backed storage directory.
+	// Reusing the durable must not recreate the stream or replay acknowledged messages.
 	restartedServer := start()
 	defer stop(restartedServer)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	a, err := New(ctx, Config{
-		URL: restartedServer.ClientURL(), Stream: "MNEMO_EVENTS",
-		Consumer: "mnemo-controller", AckWait: 2*time.Second,
+		URL: restartedServer.ClientURL(), Stream: "RESTART_EVENTS",
+		Consumer: "audit-consumer", AckWait: 2*time.Second,
 		RetryDelay: 25*time.Millisecond,
 	})
 	if err != nil {
@@ -620,7 +619,7 @@ func TestDurableCutoverPreservesDiskStateAfterEmbeddedServerRestart(t *testing.T
 	}
 	defer a.Close()
 	received := make(chan events.Event, 2)
-	sub, err := a.Subscribe(ctx, "mnemo.events.>", func(_ context.Context, event events.Event) error {
+	sub, err := a.Subscribe(ctx, "audit.events.>", func(_ context.Context, event events.Event) error {
 		received <- event
 		return nil
 	})
@@ -628,15 +627,15 @@ func TestDurableCutoverPreservesDiskStateAfterEmbeddedServerRestart(t *testing.T
 		t.Fatal(err)
 	}
 	defer sub.Close()
-	next := []byte(`{"id":"post-upgrade-id","type":"execution.closed","project":"project-x","execution_key":"execution-x","payload":{},"occurred_at":"2026-01-01T00:00:01Z"}`)
+	next := []byte(`{"id":"after-restart-id","type":"record.updated","payload":{"name":"sample"},"occurred_at":"2026-01-01T00:00:01Z"}`)
 	if err := a.Publish(ctx, events.Event{
-		ID: "post-upgrade-id", Topic: "mnemo.events.project-x", Data: next,
+		ID: "after-restart-id", Topic: "audit.events.source-a", Data: next,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case delivered := <-received:
-		if delivered.ID != "post-upgrade-id" || string(delivered.Data) != string(next) {
+		if delivered.ID != "after-restart-id" || string(delivered.Data) != string(next) {
 			t.Fatalf("event mutated or previous message replayed: %+v", delivered)
 		}
 	case <-ctx.Done():
@@ -652,7 +651,7 @@ func TestDurableCutoverPreservesDiskStateAfterEmbeddedServerRestart(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	original, err := inspector.GetMsg("MNEMO_EVENTS", pub.Sequence)
+	original, err := inspector.GetMsg("RESTART_EVENTS", pub.Sequence)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -661,13 +660,13 @@ func TestDurableCutoverPreservesDiskStateAfterEmbeddedServerRestart(t *testing.T
 	}
 	until := time.Now().Add(5 * time.Second)
 	for {
-		info, err := inspector.ConsumerInfo("MNEMO_EVENTS", "mnemo-controller")
+		info, err := inspector.ConsumerInfo("RESTART_EVENTS", "audit-consumer")
 		if err != nil {
 			t.Fatal(err)
 		}
 		if info.NumPending == 0 && info.NumAckPending == 0 &&
 			info.AckFloor.Stream == pub.Sequence+1 {
-			if info.Config.FilterSubject != "mnemo.events.>" ||
+			if info.Config.FilterSubject != "audit.events.>" ||
 				info.Config.Durable != previous.Config.Durable ||
 				info.Config.AckPolicy != previous.Config.AckPolicy ||
 				info.Config.AckWait != previous.Config.AckWait {
