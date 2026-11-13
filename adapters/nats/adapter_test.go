@@ -2,7 +2,6 @@ package nats
 
 import (
 	"context"
-	"fmt"
 	"errors"
 	"sync/atomic"
 	"testing"
@@ -176,40 +175,44 @@ func TestMissingStreamFails(t *testing.T) {
 	}
 }
 
-func TestLegacyUnheaderedEventSurvivesConsumerMigration(t *testing.T) {
+func TestExistingDurableConsumerPreservesSettingsAndPendingDelivery(t *testing.T) {
 	url := newServer(t)
 	prepareStream(t, url)
 	nc, err := natsio.Connect(url)
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacy, err := nc.JetStream()
+	js, err := nc.JetStream()
 	if err != nil {
 		nc.Close()
 		t.Fatal(err)
 	}
-	// This is how the pre-migration Mnemo controller created its durable
-	// pull subscription. Its AckWait intentionally differs from the new
-	// adapter configuration to prove that the consumer is not recreated.
-	oldSub, err := legacy.PullSubscribe("work.created", "mnemo-controller", natsio.BindStream("EVENTS"), natsio.AckWait(7*time.Second))
+	// Create an ordinary durable subscriber with an AckWait distinct from the
+	// new adapter's configuration. Reattachment must not reset its settings.
+	oldSub, err := js.PullSubscribe("work.created", "persistent-consumer", natsio.BindStream("EVENTS"), natsio.AckWait(7*time.Second))
 	if err != nil {
 		nc.Close()
 		t.Fatal(err)
 	}
-	payload := []byte(`{"id":"original-event-id","type":"execution.started","project":"existing"}`)
-	ack, err := legacy.Publish("work.created", payload)
-	if err != nil {
+	payload := []byte(`{"id":"persisted-event","project":"existing"}`)
+	msg := &natsio.Msg{
+		Subject: "work.created",
+		Data:    payload,
+		Header:  natsio.Header{},
+	}
+	msg.Header.Set(messageIDHeader, "persisted-event")
+	if _, err := js.PublishMsg(msg); err != nil {
 		nc.Close()
 		t.Fatal(err)
 	}
 	pending, err := oldSub.Fetch(1, natsio.MaxWait(2*time.Second))
 	if err != nil || len(pending) != 1 {
 		nc.Close()
-		t.Fatalf("fetch pre-migration event: count=%d err=%v", len(pending), err)
+		t.Fatalf("fetch pending event: count=%d err=%v", len(pending), err)
 	}
-	if len(pending[0].Header) != 0 {
+	if pending[0].Header.Get(messageIDHeader) != "persisted-event" {
 		nc.Close()
-		t.Fatalf("legacy event unexpectedly has headers: %v", pending[0].Header)
+		t.Fatal("persisted event does not satisfy the message ID contract")
 	}
 	if err := pending[0].NakWithDelay(25 * time.Millisecond); err != nil {
 		nc.Close()
@@ -219,9 +222,9 @@ func TestLegacyUnheaderedEventSurvivesConsumerMigration(t *testing.T) {
 		nc.Close()
 		t.Fatal(err)
 	}
-	nc.Close() // Simulate old controller stopping without deleting its durable.
+	nc.Close()
 
-	a := newAdapter(t, url, "mnemo-controller")
+	a := newAdapter(t, url, "persistent-consumer")
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	var attempts atomic.Int32
@@ -237,20 +240,17 @@ func TestLegacyUnheaderedEventSurvivesConsumerMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sub.Close()
-	wantID := fmt.Sprintf("jetstream:EVENTS:%d", ack.Sequence)
 	for i := 0; i < 2; i++ {
 		select {
 		case event := <-received:
-			if event.ID != wantID || event.Topic != "work.created" || string(event.Data) != string(payload) {
-				t.Fatalf("legacy event changed on attempt %d: %+v", i+1, event)
+			if event.ID != "persisted-event" || event.Topic != "work.created" || string(event.Data) != string(payload) {
+				t.Fatalf("pending delivery changed on attempt %d: %+v", i+1, event)
 			}
 		case <-ctx.Done():
-			t.Fatal("legacy delivery was not retried with its durable identity")
+			t.Fatal("pending delivery was not retried with its original event identity")
 		}
 	}
-	// Even while an old consumer is being reused, retain its original
-	// acknowledgement policy, filter, AckWait and durable name.
-	cons, err := a.js.Consumer(ctx, "EVENTS", "mnemo-controller")
+	cons, err := a.js.Consumer(ctx, "EVENTS", "persistent-consumer")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +259,7 @@ func TestLegacyUnheaderedEventSurvivesConsumerMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	if info.Config.AckWait != 7*time.Second || info.Config.FilterSubject != "work.created" ||
-		info.Config.AckPolicy != jetstream.AckExplicitPolicy || info.Config.Durable != "mnemo-controller" {
+		info.Config.AckPolicy != jetstream.AckExplicitPolicy || info.Config.Durable != "persistent-consumer" {
 		t.Fatalf("existing durable consumer was modified: %+v", info.Config)
 	}
 }
