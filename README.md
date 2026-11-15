@@ -41,6 +41,38 @@ defer adapter.Close()
 
 Use a different durable consumer name for each independent subscriber. Multiple replicas sharing a consumer name share its delivery workload. The NATS adapter does not embed or provision a broker.
 
+## Local watches
+
+The existing synchronous `local.Bus` can also expose one topic as an
+asynchronous, cancellable channel. `Watch` registers on the **same bus**;
+it does not create a second transport. The initial events are enqueued before
+live ones. Applications requiring an atomic state snapshot plus subscription
+must hold their own state read lock during both operations.
+
+```go
+bus := local.New()
+defer bus.Close()
+
+watch, err := bus.Watch(ctx, "state.changed", nil, 128)
+if err != nil {
+    return err
+}
+defer watch.Close()
+
+go func() {
+    for event := range watch.Events() {
+        process(event)
+    }
+}()
+```
+
+The limit bounds queued events per watcher; zero means no queue limit.
+A full queue terminates that watcher and returns `local.ErrWatchFull` to
+the publisher. Events are never silently dropped, and closing or cancelling
+the watcher terminates pending delivery without blocking publishers. Only
+the local bus offers this channel-watcher API; durable delivery remains a
+separate NATS JetStream transport under the existing event contract.
+
 ## Delivery semantics
 
 JetStream publishes are confirmed by the server. Delivery is at least once, not exactly once: consumers must commit changes idempotently before returning nil. Broker-side duplicate suppression using event IDs is limited to the stream's configured duplicate window. Event ordering and retry behavior depend on the selected transport.
