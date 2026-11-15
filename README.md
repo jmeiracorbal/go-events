@@ -92,6 +92,21 @@ defer sub.Close()
 return bus.PublishValue(ctx, "swarm.task", TaskNotification{ID: "task-42"})
 ```
 
+A typed watcher can consume the same local values asynchronously without a
+second bus:
+
+```go
+watch, err := bus.WatchValues(ctx, "swarm.task", nil, nil, 128)
+if err != nil {
+    return err
+}
+defer watch.Close()
+
+for value := range watch.Events() {
+    handleTask(value.(TaskNotification))
+}
+```
+
 Typed values are only available locally and must remain immutable while
 subscribers process them. Typed subscriptions and serialized envelope
 subscriptions use one subscriber registry but never receive one another's

@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	events "github.com/jmeiracorbal/go-events"
 )
@@ -110,4 +111,58 @@ func TestTypedLocalEventConcurrentSubscribers(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestTypedWatchFiltersAndRetainsEventOrder(t *testing.T) {
+	b := New()
+	defer b.Close()
+	ctx := context.Background()
+	initial := []any{taskNotification{ID: "initial", Revision: 1}}
+	w, err := b.WatchValues(ctx, "swarm.state", func(value any) bool {
+		return value.(taskNotification).Revision > 0
+	}, initial, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	for _, value := range []taskNotification{{ID: "ignored"}, {ID: "live", Revision: 2}} {
+		if err := b.PublishValue(ctx, "swarm.state", value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, expected := range []taskNotification{{ID: "initial", Revision: 1}, {ID: "live", Revision: 2}} {
+		select {
+		case got := <-w.Events():
+			if got != expected {
+				t.Fatalf("unexpected typed value: got=%v expected=%v", got, expected)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("missing typed value %v", expected)
+		}
+	}
+}
+
+func TestTypedWatchOverflowIsReportedToPublisher(t *testing.T) {
+	b := New()
+	defer b.Close()
+	w, err := b.WatchValues(context.Background(), "swarm.task", nil, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	var overflow error
+	for i := range 20 {
+		if err := b.PublishValue(context.Background(), "swarm.task", i); err != nil {
+			overflow = err
+			break
+		}
+	}
+	if !errors.Is(overflow, ErrWatchFull) {
+		t.Fatalf("typed watch overflow must be explicit: %v", overflow)
+	}
+	select {
+	case <-w.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("overflowed typed watcher was not closed")
+	}
 }
