@@ -1,5 +1,5 @@
 // Package local implements synchronous, in-process fan-out. It does not
-// persist events or retry handlers; Publish returns their errors directly.
+// persist events or retry handlers; publishing returns handler errors directly.
 package local
 
 import (
@@ -24,10 +24,18 @@ type subscription struct {
 	bus     *Bus
 	id      uint64
 	topic   string
-	handler events.Handler
+	handler func(context.Context, any) error
+	kind    eventKind
 	done    chan struct{}
 	closed  atomic.Bool
 }
+
+type eventKind uint8
+
+const (
+	bytesEvent eventKind = iota
+	localValue
+)
 
 var (
 	_ events.Publisher    = (*Bus)(nil)
@@ -39,14 +47,31 @@ func New() *Bus {
 	return &Bus{subs: make(map[uint64]*subscription)}
 }
 
-// Publish invokes each matching handler in registration order. Handlers may
-// publish recursively or unsubscribe without holding the bus lock.
+// Publish dispatches serializable event envelopes in registration order.
+// Each matching handler receives an independent copy of Event.Data.
 func (b *Bus) Publish(ctx context.Context, event events.Event) error {
-	if ctx == nil {
-		return errors.New("publish context is required")
-	}
 	if err := event.Validate(); err != nil {
 		return err
+	}
+	return b.publish(ctx, event.Topic, bytesEvent, event)
+}
+
+// PublishValue sends an arbitrary local-only Go value through the same bus.
+// The value must remain immutable while subscribers process it. It is never
+// serialized or forwarded to a durable transport.
+func (b *Bus) PublishValue(ctx context.Context, topic string, value any) error {
+	if err := events.ValidateTopic(topic); err != nil {
+		return err
+	}
+	if value == nil {
+		return errors.New("local event value is required")
+	}
+	return b.publish(ctx, topic, localValue, value)
+}
+
+func (b *Bus) publish(ctx context.Context, topic string, kind eventKind, value any) error {
+	if ctx == nil {
+		return errors.New("publish context is required")
 	}
 	b.mu.RLock()
 	if b.closed {
@@ -55,7 +80,7 @@ func (b *Bus) Publish(ctx context.Context, event events.Event) error {
 	}
 	subs := make([]*subscription, 0, len(b.subs))
 	for _, s := range b.subs {
-		if s.topic == event.Topic {
+		if s.topic == topic && s.kind == kind {
 			subs = append(subs, s)
 		}
 	}
@@ -70,7 +95,11 @@ func (b *Bus) Publish(ctx context.Context, event events.Event) error {
 		if s.closed.Load() {
 			continue
 		}
-		if err := s.handler(ctx, event.Clone()); err != nil {
+		delivered := value
+		if kind == bytesEvent {
+			delivered = value.(events.Event).Clone()
+		}
+		if err := s.handler(ctx, delivered); err != nil {
 			errs = append(errs, fmt.Errorf("subscriber %d: %w", s.id, err))
 		}
 	}
@@ -78,6 +107,22 @@ func (b *Bus) Publish(ctx context.Context, event events.Event) error {
 }
 
 func (b *Bus) Subscribe(ctx context.Context, topic string, handler events.Handler) (events.Subscription, error) {
+	if handler == nil {
+		return nil, errors.New("subscriber handler is required")
+	}
+	return b.subscribe(ctx, topic, bytesEvent, func(ctx context.Context, value any) error {
+		return handler(ctx, value.(events.Event))
+	})
+}
+
+// SubscribeValue registers a handler for in-process Go values, without
+// requiring a serialization format or assigning event IDs. Only PublishValue
+// dispatches to this handler; ordinary Publish subscribers remain independent.
+func (b *Bus) SubscribeValue(ctx context.Context, topic string, handler func(context.Context, any) error) (events.Subscription, error) {
+	return b.subscribe(ctx, topic, localValue, handler)
+}
+
+func (b *Bus) subscribe(ctx context.Context, topic string, kind eventKind, handler func(context.Context, any) error) (events.Subscription, error) {
 	if ctx == nil {
 		return nil, errors.New("subscription context is required")
 	}
@@ -96,7 +141,7 @@ func (b *Bus) Subscribe(ctx context.Context, topic string, handler events.Handle
 		return nil, events.ErrClosed
 	}
 	b.next++
-	s := &subscription{bus: b, id: b.next, topic: topic, handler: handler, done: make(chan struct{})}
+	s := &subscription{bus: b, id: b.next, topic: topic, handler: handler, kind: kind, done: make(chan struct{})}
 	b.subs[s.id] = s
 	b.mu.Unlock()
 
@@ -122,7 +167,7 @@ func (s *subscription) Close() error {
 }
 
 // Close prevents further publishing and subscribing. Calls already running
-// may finish; no callbacks are started from subsequently published events.
+// may finish; no callbacks start from subsequently published events.
 func (b *Bus) Close() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()

@@ -73,6 +73,31 @@ the watcher terminates pending delivery without blocking publishers. Only
 the local bus offers this channel-watcher API; durable delivery remains a
 separate NATS JetStream transport under the existing event contract.
 
+## Typed in-process notifications
+
+SwarmKit and other in-process systems can publish native Go objects through
+the **same local bus**. No serialization, external broker, second bus, or
+compatibility wrapper is involved:
+
+```go
+sub, err := bus.SubscribeValue(ctx, "swarm.task", func(_ context.Context, value any) error {
+    notification := value.(TaskNotification)
+    return handleNotification(notification)
+})
+if err != nil {
+    return err
+}
+defer sub.Close()
+
+return bus.PublishValue(ctx, "swarm.task", TaskNotification{ID: "task-42"})
+```
+
+Typed values are only available locally and must remain immutable while
+subscribers process them. Typed subscriptions and serialized envelope
+subscriptions use one subscriber registry but never receive one another's
+payloads. Handler errors propagate to the publisher. The durable NATS adapter
+and the serializable `events.Event` contract remain unchanged.
+
 ## Delivery semantics
 
 JetStream publishes are confirmed by the server. Delivery is at least once, not exactly once: consumers must commit changes idempotently before returning nil. Broker-side duplicate suppression using event IDs is limited to the stream's configured duplicate window. Event ordering and retry behavior depend on the selected transport.
