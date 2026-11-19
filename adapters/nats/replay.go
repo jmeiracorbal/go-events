@@ -52,16 +52,15 @@ func (a *Adapter) Replay(ctx context.Context, from events.Cursor, subject, consu
 		return nil, fmt.Errorf("%w: position %d exceeds snapshot upper bound %d", events.ErrInvalidCursor, from.AfterSequence, from.UpperBound)
 	}
 
-	a.mu.Lock()
-	if a.closed {
-		a.mu.Unlock()
-		return nil, events.ErrClosed
+	if err := a.reserveSubscription(); err != nil {
+		return nil, err
 	}
-	if len(a.subs) != 0 {
-		a.mu.Unlock()
-		return nil, errors.New("NATS adapter already has an active subscriber")
-	}
-	a.mu.Unlock()
+	reserved := true
+	defer func() {
+		if reserved {
+			a.releaseSubscriptionReservation()
+		}
+	}()
 
 	cons, err := a.js.Consumer(ctx, a.cfg.Stream, consumer)
 	switch {
@@ -157,6 +156,7 @@ func (a *Adapter) Replay(ctx context.Context, from events.Cursor, subject, consu
 	if err != nil {
 		return nil, historyError(fmt.Sprintf("consume replay stream %q", a.cfg.Stream), err)
 	}
+	reserved = false
 	return a.registerSubscription(ctx, consume)
 }
 
