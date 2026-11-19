@@ -33,8 +33,9 @@ type Adapter struct {
 	conn   *natsio.Conn
 	js     jetstream.JetStream
 	mu     sync.Mutex
-	subs   map[*subscription]struct{}
-	closed bool
+	subs     map[*subscription]struct{}
+	starting bool
+	closed   bool
 }
 
 type subscription struct {
@@ -126,16 +127,15 @@ func (a *Adapter) Subscribe(ctx context.Context, topic string, handler events.Ha
 	if a.cfg.Consumer == "" || a.cfg.AckWait <= 0 || a.cfg.RetryDelay <= 0 {
 		return nil, errors.New("NATS consumer, ack wait, and retry delay must be configured")
 	}
-	a.mu.Lock()
-	if a.closed {
-		a.mu.Unlock()
-		return nil, events.ErrClosed
+	if err := a.reserveSubscription(); err != nil {
+		return nil, err
 	}
-	if len(a.subs) != 0 {
-		a.mu.Unlock()
-		return nil, errors.New("NATS adapter already has an active subscriber")
-	}
-	a.mu.Unlock()
+	reserved := true
+	defer func() {
+		if reserved {
+			a.releaseSubscriptionReservation()
+		}
+	}()
 
 	// Reuse an existing durable consumer without rewriting its delivery
 	// configuration or progress. Creating a missing consumer is the normal
@@ -196,7 +196,32 @@ func (a *Adapter) Subscribe(ctx context.Context, topic string, handler events.Ha
 	if err != nil {
 		return nil, fmt.Errorf("consume JetStream stream %q: %w", a.cfg.Stream, err)
 	}
+	reserved = false
 	return a.registerSubscription(ctx, consume)
+}
+
+// reserveSubscription is held across JetStream consumer lookup, creation and
+// Consume setup. A competing Subscribe or Replay must not create a durable
+// consumer that it will not be permitted to use.
+func (a *Adapter) reserveSubscription() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return events.ErrClosed
+	}
+	if a.starting || len(a.subs) != 0 {
+		return errors.New("NATS adapter already has an active subscriber")
+	}
+	a.starting = true
+	return nil
+}
+
+// releaseSubscriptionReservation runs only when setup returns early.
+// The successful path transfers the reservation to registerSubscription.
+func (a *Adapter) releaseSubscriptionReservation() {
+	a.mu.Lock()
+	a.starting = false
+	a.mu.Unlock()
 }
 
 // registerSubscription tracks the lifetime of a live JetStream consume loop.
@@ -205,6 +230,7 @@ func (a *Adapter) Subscribe(ctx context.Context, topic string, handler events.Ha
 func (a *Adapter) registerSubscription(ctx context.Context, consume jetstream.ConsumeContext) (events.Subscription, error) {
 	s := &subscription{adapter: a, consume: consume, done: make(chan struct{})}
 	a.mu.Lock()
+	a.starting = false
 	if a.closed || len(a.subs) != 0 {
 		a.mu.Unlock()
 		consume.Stop()
