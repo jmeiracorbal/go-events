@@ -41,6 +41,110 @@ defer adapter.Close()
 
 Use a different durable consumer name for each independent subscriber. Multiple replicas sharing a consumer name share its delivery workload. The NATS adapter does not embed or provision a broker.
 
+## JetStream history
+
+The NATS adapter also implements the optional `events.HistoryReader` interface.
+These calls read retained messages directly from the configured stream. They do
+not create consumers or modify durable consumer progress.
+
+```go
+// Read exactly one stored stream sequence (not a logical event ID).
+stored, err := adapter.Get(ctx, 42)
+if errors.Is(err, events.ErrEventNotFound) {
+    // The sequence is not retained, or never existed.
+}
+if err != nil {
+    return err
+}
+fmt.Printf("%s: %s\n", stored.Event.ID, stored.Event.Data)
+```
+
+Historical queries are ordered by JetStream stream sequence, with server-side
+filtering by subject (including NATS wildcards). Each page must request between
+1 and `events.MaxHistoryPageSize` (256) entries:
+
+```go
+query := events.ReadQuery{Subject: "task.>", Limit: 50}
+for {
+    page, err := adapter.Read(ctx, query)
+    if err != nil {
+        return err
+    }
+    for _, stored := range page.Events {
+        if err := inspectEvent(ctx, stored); err != nil {
+            return err
+        }
+    }
+    if !page.HasMore {
+        break
+    }
+    query.Cursor = page.Next
+}
+```
+
+The first page captures an inclusive `Cursor.UpperBound`; later pages retain
+the same bound even when new events are published. `AfterSequence` is
+exclusive. A cursor with a position must identify its stream, and subsequent
+requests must retain the same subject filter. A zero cursor starts at the
+earliest retained message. Deleted sequences are skipped, and a saved cursor
+that falls outside the stream retention window returns
+`events.ErrHistoryExpired`. A paginated read is **not** a transactional
+snapshot: a later purge or expiration can remove messages before they are read.
+
+`StoredEvent` exposes the original `Event` together with `Stream`,
+`Sequence` and `StoredAt`. The payload remains opaque; neither IDs nor
+payload content are indexed by `Get` or `Read`.
+
+## JetStream replay and continuous delivery
+
+The optional `events.ReplaySubscriber` interface uses the **same durable
+JetStream pull consumer** to read retained events and continue receiving new
+ones. No separate historical-to-live handoff, local database or background
+polling process is needed.
+
+```go
+sub, err := adapter.Replay(
+    ctx,
+    events.Cursor{Stream: "EVENTS", AfterSequence: 41},
+    "task.>",
+    "task-projection",
+    func(ctx context.Context, stored events.StoredEvent) error {
+        // Commit effects idempotently before returning nil.
+        return projectEvent(ctx, stored.Event.ID, stored.Event.Data)
+    },
+)
+if err != nil {
+    return err
+}
+defer sub.Close()
+```
+
+`Replay` requires a nonempty subject, a distinct durable consumer name and
+positive `AckWait` and `RetryDelay` in `nats.Config`. For a **new**
+consumer it starts strictly after `AfterSequence` (or at the first retained
+event for an empty cursor). If that durable consumer already exists, **its
+broker-acknowledged position takes precedence over the supplied cursor**.
+An incompatible existing consumer returns `events.ErrConsumerIncompatible`;
+the adapter never resets or reconfigures it. Closing or cancelling the
+subscription does not delete the durable.
+
+The handler receives `StoredEvent.DeliveryAttempt` (1 for initial delivery;
+greater values for retries). Returning nil triggers an explicit confirmed ACK.
+A returned error triggers a NAK with the configured retry delay. Delivery is
+**at least once**: callbacks must be idempotent, since messages may be
+redelivered and retries can change processing order. Stream retention is the
+limit of recoverable history; it is not an exactly-once guarantee.
+
+`Cursor.UpperBound` limits `Read` only; `Replay` intentionally continues
+past it. If a new consumer starts from a saved cursor, intervening events are
+replayed as long as JetStream still retains them. Each adapter instance
+supports one active `Subscribe` or `Replay` subscription, and a durable
+name must not be reused across independently acknowledged subscribers.
+
+A runnable example is available at [examples/replay](examples/replay);
+it requires an existing NATS JetStream stream and explicit connection,
+stream, subject and consumer environment variables.
+
 ## Local watches
 
 The existing synchronous `local.Bus` can also expose one topic as an
