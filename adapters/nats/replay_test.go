@@ -74,21 +74,24 @@ func TestReplayBacklogAndLiveUseSameConsumer(t *testing.T) {
 	}
 	defer sub.Close()
 
-	for _, sequence := range []uint64{2, 3} {
+	// Publish before the historical backlog is drained to verify that the
+	// same server consumer covers the history/live boundary without a gap.
+	publishReplayEvents(t, ctx, publisher, 4, 4)
+	for _, sequence := range []uint64{2, 3, 4} {
 		event := recvReplay(t, ctx, received)
 		if event.Sequence != sequence || event.Stream != "EVENTS" ||
 			event.Event.ID != fmt.Sprintf("replay-%d", sequence) ||
 			string(event.Event.Data) != fmt.Sprintf("payload-%d", sequence) ||
 			event.StoredAt.IsZero() || event.DeliveryAttempt != 1 {
-			t.Fatalf("unexpected historical replay event: %+v", event)
+			t.Fatalf("unexpected replay event across history/live boundary: %+v", event)
 		}
 	}
-	publishReplayEvents(t, ctx, publisher, 4, 4)
+	publishReplayEvents(t, ctx, publisher, 5, 5)
 	event := recvReplay(t, ctx, received)
-	if event.Sequence != 4 || event.Event.ID != "replay-4" || event.DeliveryAttempt != 1 {
-		t.Fatalf("expected live continuation from same durable consumer: %+v", event)
+	if event.Sequence != 5 || event.Event.ID != "replay-5" || event.DeliveryAttempt != 1 {
+		t.Fatalf("expected ongoing live continuation: %+v", event)
 	}
-	waitReplayAck(t, ctx, replayer, "backlog-live", 4)
+	waitReplayAck(t, ctx, replayer, "backlog-live", 5)
 }
 
 func TestReplayFailureRedeliveryAndResumeAfterAdapterRestart(t *testing.T) {
