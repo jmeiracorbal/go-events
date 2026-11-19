@@ -9,9 +9,9 @@ import (
 const MaxHistoryPageSize = 256
 
 var (
-	ErrEventNotFound     = errors.New("stored event not found")
-	ErrInvalidCursor     = errors.New("invalid history cursor")
-	ErrHistoryExpired    = errors.New("history cursor is older than retained events")
+	ErrEventNotFound      = errors.New("stored event not found")
+	ErrInvalidCursor      = errors.New("invalid history cursor")
+	ErrHistoryExpired     = errors.New("history cursor is older than retained events")
 	ErrHistoryUnavailable = errors.New("event history is unavailable")
 )
 
