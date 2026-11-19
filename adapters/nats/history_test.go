@@ -198,6 +198,7 @@ func TestHistoryReadValidationAndEmptyStream(t *testing.T) {
 		query events.ReadQuery
 		want  error
 	}{
+		{"unscoped position", events.ReadQuery{Limit: 1, Cursor: events.Cursor{AfterSequence: 1}}, events.ErrInvalidCursor},
 		{"wrong stream", events.ReadQuery{Limit: 1, Cursor: events.Cursor{Stream: "OTHER"}}, events.ErrInvalidCursor},
 		{"future bound", events.ReadQuery{Limit: 1, Cursor: events.Cursor{Stream: "EVENTS", UpperBound: 2}}, events.ErrInvalidCursor},
 		{"future position", events.ReadQuery{Limit: 1, Cursor: events.Cursor{Stream: "EVENTS", AfterSequence: 2}}, events.ErrInvalidCursor},
