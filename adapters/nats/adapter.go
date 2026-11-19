@@ -196,12 +196,22 @@ func (a *Adapter) Subscribe(ctx context.Context, topic string, handler events.Ha
 	if err != nil {
 		return nil, fmt.Errorf("consume JetStream stream %q: %w", a.cfg.Stream, err)
 	}
+	return a.registerSubscription(ctx, consume)
+}
+
+// registerSubscription tracks the lifetime of a live JetStream consume loop.
+// Each Adapter has one active subscription at a time, regardless of whether it
+// originated from Subscribe or Replay. Closing it retains the durable consumer.
+func (a *Adapter) registerSubscription(ctx context.Context, consume jetstream.ConsumeContext) (events.Subscription, error) {
 	s := &subscription{adapter: a, consume: consume, done: make(chan struct{})}
 	a.mu.Lock()
 	if a.closed || len(a.subs) != 0 {
 		a.mu.Unlock()
 		consume.Stop()
-		return nil, events.ErrClosed
+		if a.closed {
+			return nil, events.ErrClosed
+		}
+		return nil, errors.New("NATS adapter already has an active subscriber")
 	}
 	a.subs[s] = struct{}{}
 	a.mu.Unlock()
