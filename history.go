@@ -13,6 +13,7 @@ var (
 	ErrInvalidCursor      = errors.New("invalid history cursor")
 	ErrHistoryExpired     = errors.New("history cursor is older than retained events")
 	ErrHistoryUnavailable = errors.New("event history is unavailable")
+	ErrConsumerIncompatible = errors.New("incompatible durable consumer configuration")
 )
 
 // StoredEvent preserves the original opaque event and its server-side
@@ -22,6 +23,10 @@ type StoredEvent struct {
 	Stream   string
 	Sequence uint64
 	StoredAt time.Time
+
+	// DeliveryAttempt is set only for Replay deliveries; Get and Read return
+	// zero because historical reads do not have a delivery attempt.
+	DeliveryAttempt uint64
 }
 
 // Cursor identifies a stable, stream-scoped historical window. AfterSequence
@@ -55,4 +60,19 @@ type EventPage struct {
 type HistoryReader interface {
 	Get(context.Context, uint64) (StoredEvent, error)
 	Read(context.Context, ReadQuery) (EventPage, error)
+}
+
+// ReplayHandler handles one retained or newly published event. Returning nil
+// indicates its effects have been committed and allows the transport to ACK.
+// On error the durable transport requests redelivery; handlers must be
+// idempotent because delivery is at least once.
+type ReplayHandler func(context.Context, StoredEvent) error
+
+// ReplaySubscriber is an optional capability that resumes from a stream cursor
+// and continues with live events using the same durable broker consumer.
+// A previously created durable consumer resumes from broker-acknowledged
+// progress, rather than resetting its position from the supplied cursor.
+// UpperBound, used by Read for snapshot pagination, does not stop Replay.
+type ReplaySubscriber interface {
+	Replay(context.Context, Cursor, string, string, ReplayHandler) (Subscription, error)
 }
