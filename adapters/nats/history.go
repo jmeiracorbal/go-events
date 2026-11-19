@@ -45,6 +45,9 @@ func (a *Adapter) Read(ctx context.Context, query events.ReadQuery) (events.Even
 			return events.EventPage{}, err
 		}
 	}
+	if query.Cursor.Stream == "" && (query.Cursor.AfterSequence != 0 || query.Cursor.UpperBound != 0) {
+		return events.EventPage{}, fmt.Errorf("%w: positioned cursor must identify its stream", events.ErrInvalidCursor)
+	}
 	if query.Cursor.Stream != "" && query.Cursor.Stream != a.cfg.Stream {
 		return events.EventPage{}, fmt.Errorf("%w: cursor stream %q does not match %q", events.ErrInvalidCursor, query.Cursor.Stream, a.cfg.Stream)
 	}
@@ -90,6 +93,13 @@ func (a *Adapter) Read(ctx context.Context, query events.ReadQuery) (events.Even
 		}
 		msg, err := stream.GetMsg(ctx, next, jetstream.WithGetMsgSubject(subject))
 		if errors.Is(err, jetstream.ErrMsgNotFound) {
+			current, infoErr := stream.Info(ctx)
+			if infoErr != nil {
+				return events.EventPage{}, historyError("check history retention", infoErr)
+			}
+			if current.State.FirstSeq > next && next <= bound {
+				return events.EventPage{}, fmt.Errorf("%w: sequence %d predates first retained sequence %d", events.ErrHistoryExpired, next, current.State.FirstSeq)
+			}
 			break
 		}
 		if err != nil {
