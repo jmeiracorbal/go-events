@@ -134,7 +134,6 @@ func (a *Adapter) Replay(ctx context.Context, from events.Cursor, subject, consu
 		a.processDelivery(ctx, msg, stored.Event,
 			fmt.Sprintf("replay event %q at sequence %d", stored.Event.ID, stored.Sequence),
 			func() error { return handler(ctx, stored) })
-
 	}, jetstream.PullMaxMessages(replayMaxPendingMessages), jetstream.ConsumeErrHandler(func(_ jetstream.ConsumeContext, err error) {
 		a.report(fmt.Errorf("consume replay stream %q: %w", a.cfg.Stream, err))
 	}))
