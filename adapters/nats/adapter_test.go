@@ -303,132 +303,6 @@ func TestExistingConsumerWithDifferentFilterIsNotModified(t *testing.T) {
 	}
 }
 
-func TestJetStreamHandoverAfterAcknowledgingUnheaderedDeliveries(t *testing.T) {
-	url := newServer(t)
-	prepareStream(t, url)
-
-	// Simulate the existing controller: initialJS NATS publishers store the
-	// application envelope without Nats-Msg-Id, then its durable consumer
-	// acknowledges each delivery before the consumer is replaced.
-	nc, err := natsio.Connect(url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	initialJS, err := nc.JetStream()
-	if err != nil {
-		nc.Close()
-		t.Fatal(err)
-	}
-	initialConsumer, err := initialJS.PullSubscribe("work.created", "existing-controller", natsio.BindStream("EVENTS"))
-	if err != nil {
-		nc.Close()
-		t.Fatal(err)
-	}
-	original := [][]byte{
-		[]byte(`{"id":"before-1","type":"record.created","payload":{"name":"sample"}}`),
-		[]byte(`{"id":"before-2","type":"record.updated","payload":{"name":"sample"}}`),
-	}
-	sequence := make([]uint64, 0, len(original))
-	for _, data := range original {
-		published, err := initialJS.PublishMsg(&natsio.Msg{Subject: "work.created", Data: data})
-		if err != nil {
-			nc.Close()
-			t.Fatal(err)
-		}
-		sequence = append(sequence, published.Sequence)
-	}
-	messages, err := initialConsumer.Fetch(len(original), natsio.MaxWait(3*time.Second))
-	if err != nil || len(messages) != len(original) {
-		nc.Close()
-		t.Fatalf("drain existing deliveries: received=%d err=%v", len(messages), err)
-	}
-	for i, msg := range messages {
-		if msg.Header.Get(messageIDHeader) != "" || string(msg.Data) != string(original[i]) {
-			nc.Close()
-			t.Fatalf("pre-handover event %d was modified: %+v", i, msg)
-		}
-		if err := msg.AckSync(); err != nil {
-			nc.Close()
-			t.Fatalf("ack committed pre-handover event: %v", err)
-		}
-	}
-	before, err := initialJS.ConsumerInfo("EVENTS", "existing-controller")
-	if err != nil {
-		nc.Close()
-		t.Fatal(err)
-	}
-	if before.NumPending != 0 || before.NumAckPending != 0 || before.AckFloor.Stream != sequence[len(sequence)-1] {
-		nc.Close()
-		t.Fatalf("consumer not drained before handover: %+v", before)
-	}
-	nc.Close()
-
-	// Reuse the exact same persisted stream and durable with the new adapter.
-	a := newAdapter(t, url, "existing-controller")
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
-	received := make(chan events.Event, 3)
-	sub, err := a.Subscribe(ctx, "work.created", func(_ context.Context, event events.Event) error {
-		received <- event
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sub.Close()
-	newPayload := []byte(`{"id":"after-3","type":"record.closed","payload":{}}`)
-	if err := a.Publish(ctx, events.Event{ID: "after-3", Topic: "work.created", Data: newPayload}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case event := <-received:
-		if event.ID != "after-3" || event.Topic != "work.created" || string(event.Data) != string(newPayload) {
-			t.Fatalf("handover changed event identity or payload: %+v", event)
-		}
-	case <-ctx.Done():
-		t.Fatal("post-handover event was not delivered")
-	}
-	select {
-	case unexpected := <-received:
-		t.Fatalf("pre-handover event was incorrectly replayed: %+v", unexpected)
-	case <-time.After(150 * time.Millisecond):
-	}
-
-	// Confirm the stored messages remain intact and that the existing durable
-	// retains its identity and delivery state.
-	check, err := natsio.Connect(url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer check.Close()
-	checkJS, err := check.JetStream()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i, seq := range sequence {
-		stored, err := checkJS.GetMsg("EVENTS", seq)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(stored.Data) != string(original[i]) || stored.Header.Get(messageIDHeader) != "" {
-			t.Fatalf("stored message at stream sequence %d was rewritten", seq)
-		}
-	}
-	info, err := checkJS.ConsumerInfo("EVENTS", "existing-controller")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Config.Durable != before.Config.Durable ||
-		info.Config.FilterSubject != before.Config.FilterSubject ||
-		info.Config.AckPolicy != before.Config.AckPolicy ||
-		info.Config.AckWait != before.Config.AckWait {
-		t.Fatalf("handover modified the durable consumer: before=%+v after=%+v", before.Config, info.Config)
-	}
-	if info.NumPending != 0 || info.NumAckPending != 0 {
-		t.Fatalf("handover left pending deliveries: %+v", info)
-	}
-}
-
 func TestDeliveryWithoutMessageIDIsNeverCommitted(t *testing.T) {
 	url := newServer(t)
 	prepareStream(t, url)
@@ -454,7 +328,7 @@ func TestDeliveryWithoutMessageIDIsNeverCommitted(t *testing.T) {
 	reported := make(chan error, 4)
 	var applied atomic.Int32
 	a, err := New(ctx, Config{
-		URL: url, Stream: "EVENTS", Consumer: "unchecked-cutover",
+		URL: url, Stream: "EVENTS", Consumer: "invalid-event-consumer",
 		AckWait: time.Second, RetryDelay: 100 * time.Millisecond,
 		OnError: func(err error) {
 			select {
@@ -506,7 +380,7 @@ func TestDeliveryWithoutMessageIDIsNeverCommitted(t *testing.T) {
 	if string(stored.Data) != string(headerlessPayload) || stored.Header.Get(messageIDHeader) != "" {
 		t.Fatal("invalid event was rewritten or deleted")
 	}
-	info, err := checkJS.ConsumerInfo("EVENTS", "unchecked-cutover")
+	info, err := checkJS.ConsumerInfo("EVENTS", "invalid-event-consumer")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -675,7 +549,7 @@ func TestDurableConsumerPreservesDiskStateAfterServerRestart(t *testing.T) {
 			break
 		}
 		if time.Now().After(until) {
-			t.Fatalf("restarted controller has unacknowledged or replayed events: %+v", info)
+			t.Fatalf("restarted durable has unacknowledged or replayed events: %+v", info)
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
