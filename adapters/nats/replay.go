@@ -115,41 +115,25 @@ func (a *Adapter) Replay(ctx context.Context, from events.Cursor, subject, consu
 	}
 
 	consume, err := cons.Consume(func(msg jetstream.Msg) {
-		meta, metaErr := msg.Metadata()
-		if metaErr != nil {
-			a.rejectReplay(msg, fmt.Errorf("decode replay metadata: %w", metaErr))
+		meta, err := msg.Metadata()
+		if err != nil {
+			a.rejectDelivery(msg, fmt.Errorf("decode replay metadata: %w", err))
 			return
 		}
 		if meta.Stream != a.cfg.Stream {
-			a.rejectReplay(msg, fmt.Errorf("unexpected replay stream %q, expected %q", meta.Stream, a.cfg.Stream))
+			a.rejectDelivery(msg, fmt.Errorf("unexpected replay stream %q, expected %q", meta.Stream, a.cfg.Stream))
 			return
 		}
 		stored := events.StoredEvent{
-			Event: events.Event{
-				ID:    msg.Headers().Get(messageIDHeader),
-				Topic: msg.Subject(),
-				Data:  append([]byte(nil), msg.Data()...),
-			},
+			Event:           eventFromMessage(msg),
 			Stream:          meta.Stream,
 			Sequence:        meta.Sequence.Stream,
 			StoredAt:        meta.Timestamp,
 			DeliveryAttempt: meta.NumDelivered,
 		}
-		if err := stored.Event.Validate(); err != nil {
-			a.rejectReplay(msg, fmt.Errorf("invalid replay event: %w", err))
-			return
-		}
-		if err := ctx.Err(); err != nil {
-			a.rejectReplay(msg, fmt.Errorf("replay canceled: %w", err))
-			return
-		}
-		if err := handler(ctx, stored); err != nil {
-			a.rejectReplay(msg, fmt.Errorf("handle replay event %q at sequence %d: %w", stored.Event.ID, stored.Sequence, err))
-			return
-		}
-		if err := msg.DoubleAck(ctx); err != nil {
-			a.report(fmt.Errorf("ack replay event %q at sequence %d: %w", stored.Event.ID, stored.Sequence, err))
-		}
+		a.processDelivery(ctx, msg, stored.Event,
+			fmt.Sprintf("replay event %q at sequence %d", stored.Event.ID, stored.Sequence),
+			func() error { return handler(ctx, stored) })
 	}, jetstream.PullMaxMessages(replayMaxPendingMessages), jetstream.ConsumeErrHandler(func(_ jetstream.ConsumeContext, err error) {
 		a.report(fmt.Errorf("consume replay stream %q: %w", a.cfg.Stream, err))
 	}))
@@ -160,9 +144,3 @@ func (a *Adapter) Replay(ctx context.Context, from events.Cursor, subject, consu
 	return a.registerSubscription(ctx, consume)
 }
 
-func (a *Adapter) rejectReplay(msg jetstream.Msg, cause error) {
-	a.report(cause)
-	if err := msg.NakWithDelay(a.cfg.RetryDelay); err != nil {
-		a.report(fmt.Errorf("reject replay delivery: %w", err))
-	}
-}

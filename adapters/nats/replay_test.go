@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	events "github.com/jmeiracorbal/go-events"
+	natsio "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -327,5 +329,73 @@ func TestReplayValidationAndSingleActiveSubscription(t *testing.T) {
 	}
 	if _, err := a.Replay(ctx, events.Cursor{}, "work.created", "after-close", noop); !errors.Is(err, events.ErrClosed) {
 		t.Fatalf("expected closed adapter, got %v", err)
+	}
+}
+
+func TestReplayInvalidEventIsRejectedWithoutAcknowledgement(t *testing.T) {
+	url := newServer(t)
+	prepareStream(t, url)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	reported := make(chan error, 4)
+	var applied atomic.Int32
+	a, err := New(ctx, Config{
+		URL: url, Stream: "EVENTS",
+		AckWait: time.Second, RetryDelay: 100 * time.Millisecond,
+		OnError: func(err error) {
+			select {
+			case reported <- err:
+			default:
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	// Publishing outside the event contract is intentional: replay must
+	// reject a message without Nats-Msg-Id, just like Subscribe.
+	_, err = a.js.PublishMsg(ctx, &natsio.Msg{
+		Subject: "work.created",
+		Data: []byte(`{"id":"not-a-jetstream-message-id"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := a.Replay(ctx, events.Cursor{}, "work.created", "replay-invalid-event",
+		func(context.Context, events.StoredEvent) error {
+			applied.Add(1)
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	select {
+	case err := <-reported:
+		if !strings.Contains(err.Error(), "event ID is required") {
+			t.Fatalf("unexpected invalid replay error: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("invalid replay event was not rejected")
+	}
+	if err := sub.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if applied.Load() != 0 {
+		t.Fatalf("invalid replay event was delivered to handler %d times", applied.Load())
+	}
+	consumer, err := a.js.Consumer(ctx, "EVENTS", "replay-invalid-event")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := consumer.Info(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.AckFloor.Stream != 0 {
+		t.Fatalf("invalid replay event was acknowledged: %+v", info)
 	}
 }
