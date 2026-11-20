@@ -368,79 +368,82 @@ func TestDurableConsumerPreservesDiskStateAfterServerRestart(t *testing.T) {
 		server.Shutdown()
 		server.WaitForShutdown()
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	// Create a file-backed JetStream stream and durable consumer that must survive a server restart.
-	originalServer := start()
-	nc, err := natsio.Connect(originalServer.ClientURL())
+	initialServer := start()
+	nc, err := natsio.Connect(initialServer.ClientURL())
 	if err != nil {
-		stop(originalServer)
+		stop(initialServer)
 		t.Fatal(err)
 	}
-	initialJS, err := nc.JetStream()
+	js, err := jetstream.New(nc)
 	if err != nil {
 		nc.Close()
-		stop(originalServer)
+		stop(initialServer)
 		t.Fatal(err)
 	}
-	if _, err := initialJS.AddStream(&natsio.StreamConfig{
+	_, err = js.CreateStream(ctx, jetstream.StreamConfig{
 		Name: "RESTART_EVENTS", Subjects: []string{"audit.events.>"},
-		Storage: natsio.FileStorage, Retention: natsio.LimitsPolicy,
-	}); err != nil {
-		nc.Close()
-		stop(originalServer)
-		t.Fatal(err)
-	}
-	initialConsumer, err := initialJS.PullSubscribe("audit.events.>", "audit-consumer", natsio.BindStream("RESTART_EVENTS"))
+		Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy,
+	})
 	if err != nil {
 		nc.Close()
-		stop(originalServer)
+		stop(initialServer)
 		t.Fatal(err)
 	}
-	persisted := []byte(`{"id":"before-restart-id","type":"record.created","payload":{"name":"sample"},"occurred_at":"2026-01-01T00:00:00Z"}`)
-	pub, err := initialJS.Publish("audit.events.source-a", persisted)
+	consumer, err := js.CreateConsumer(ctx, "RESTART_EVENTS", jetstream.ConsumerConfig{
+		Durable: "audit-consumer", FilterSubject: "audit.events.>",
+		AckPolicy: jetstream.AckExplicitPolicy, AckWait: 7*time.Second,
+	})
 	if err != nil {
 		nc.Close()
-		stop(originalServer)
+		stop(initialServer)
 		t.Fatal(err)
 	}
-	pending, err := initialConsumer.Fetch(1, natsio.MaxWait(3*time.Second))
-	if err != nil || len(pending) != 1 {
-		nc.Close()
-		stop(originalServer)
-		t.Fatalf("fetch existing delivery: messages=%d err=%v", len(pending), err)
-	}
-	if pending[0].Header.Get(messageIDHeader) != "" || string(pending[0].Data) != string(persisted) {
-		nc.Close()
-		stop(originalServer)
-		t.Fatal("stored message does not match its original wire format")
-	}
-	if err := pending[0].AckSync(); err != nil {
-		nc.Close()
-		stop(originalServer)
-		t.Fatal(err)
-	}
-	previous, err := initialJS.ConsumerInfo("RESTART_EVENTS", "audit-consumer")
+	persisted := []byte(`{"id":"event-before-restart","type":"record.created"}`)
+	original := &natsio.Msg{Subject: "audit.events.source-a", Data: persisted, Header: natsio.Header{}}
+	original.Header.Set(messageIDHeader, "event-before-restart")
+	pub, err := js.PublishMsg(ctx, original)
 	if err != nil {
 		nc.Close()
-		stop(originalServer)
+		stop(initialServer)
+		t.Fatal(err)
+	}
+	delivery, err := consumer.Next(jetstream.FetchMaxWait(3*time.Second))
+	if err != nil {
+		nc.Close()
+		stop(initialServer)
+		t.Fatal(err)
+	}
+	if delivery.Headers().Get(messageIDHeader) != "event-before-restart" {
+		nc.Close()
+		stop(initialServer)
+		t.Fatal("original event ID changed")
+	}
+	if err := delivery.DoubleAck(ctx); err != nil {
+		nc.Close()
+		stop(initialServer)
+		t.Fatal(err)
+	}
+	previous, err := consumer.Info(ctx)
+	if err != nil {
+		nc.Close()
+		stop(initialServer)
 		t.Fatal(err)
 	}
 	if previous.NumPending != 0 || previous.NumAckPending != 0 || previous.AckFloor.Stream != pub.Sequence {
 		nc.Close()
-		stop(originalServer)
-		t.Fatalf("initial consumer has uncommitted deliveries: %+v", previous)
+		stop(initialServer)
+		t.Fatalf("first consumer has unsettled deliveries: %+v", previous)
 	}
 	nc.Close()
-	stop(originalServer)
+	stop(initialServer)
 
-	// Restart the broker using the same file-backed storage directory.
-	// Reusing the durable must not recreate the stream or replay acknowledged messages.
-	restartedServer := start()
-	defer stop(restartedServer)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	restarted := start()
+	defer stop(restarted)
 	a, err := New(ctx, Config{
-		URL: restartedServer.ClientURL(), Stream: "RESTART_EVENTS",
+		URL: restarted.ClientURL(), Stream: "RESTART_EVENTS",
 		Consumer: "audit-consumer", AckWait: 2*time.Second,
 		RetryDelay: 25*time.Millisecond,
 	})
@@ -457,55 +460,52 @@ func TestDurableConsumerPreservesDiskStateAfterServerRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sub.Close()
-	next := []byte(`{"id":"after-restart-id","type":"record.updated","payload":{"name":"sample"},"occurred_at":"2026-01-01T00:00:01Z"}`)
+	next := []byte(`{"id":"event-after-restart","type":"record.updated"}`)
 	if err := a.Publish(ctx, events.Event{
-		ID: "after-restart-id", Topic: "audit.events.source-a", Data: next,
+		ID: "event-after-restart", Topic: "audit.events.source-a", Data: next,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	select {
-	case delivered := <-received:
-		if delivered.ID != "after-restart-id" || string(delivered.Data) != string(next) {
-			t.Fatalf("event mutated or previous message replayed: %+v", delivered)
+	case event := <-received:
+		if event.ID != "event-after-restart" || string(event.Data) != string(next) {
+			t.Fatalf("unexpected delivery after broker restart: %+v", event)
 		}
 	case <-ctx.Done():
-		t.Fatal("delivery after broker restart was not processed")
+		t.Fatal("new event was not delivered after broker restart")
 	}
-
-	inspect, err := natsio.Connect(restartedServer.ClientURL())
+	stream, err := a.js.Stream(ctx, "RESTART_EVENTS")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer inspect.Close()
-	inspector, err := inspect.JetStream()
+	stored, err := stream.GetMsg(ctx, pub.Sequence)
 	if err != nil {
 		t.Fatal(err)
 	}
-	original, err := inspector.GetMsg("RESTART_EVENTS", pub.Sequence)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(original.Data) != string(persisted) || original.Header.Get(messageIDHeader) != "" {
-		t.Fatal("previous event was modified or reencoded during broker restart")
+	if string(stored.Data) != string(persisted) || stored.Header.Get(messageIDHeader) != "event-before-restart" {
+		t.Fatal("original stored event changed across broker restart")
 	}
 	until := time.Now().Add(5 * time.Second)
 	for {
-		info, err := inspector.ConsumerInfo("RESTART_EVENTS", "audit-consumer")
+		existing, err := a.js.Consumer(ctx, "RESTART_EVENTS", "audit-consumer")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if info.NumPending == 0 && info.NumAckPending == 0 &&
-			info.AckFloor.Stream == pub.Sequence+1 {
+		info, err := existing.Info(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.NumPending == 0 && info.NumAckPending == 0 && info.AckFloor.Stream == pub.Sequence+1 {
 			if info.Config.FilterSubject != "audit.events.>" ||
 				info.Config.Durable != previous.Config.Durable ||
 				info.Config.AckPolicy != previous.Config.AckPolicy ||
 				info.Config.AckWait != previous.Config.AckWait {
-				t.Fatalf("durable changed across server restart: %+v", info.Config)
+				t.Fatalf("durable configuration changed across broker restart: %+v", info.Config)
 			}
 			break
 		}
 		if time.Now().After(until) {
-			t.Fatalf("restarted durable has unacknowledged or replayed events: %+v", info)
+			t.Fatalf("broker restart did not preserve durable progress: %+v", info)
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
