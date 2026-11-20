@@ -32,7 +32,7 @@ type Adapter struct {
 	cfg    Config
 	conn   *natsio.Conn
 	js     jetstream.JetStream
-	mu     sync.Mutex
+	mu       sync.Mutex
 	subs     map[*subscription]struct{}
 	starting bool
 	closed   bool
@@ -164,40 +164,52 @@ func (a *Adapter) Subscribe(ctx context.Context, topic string, handler events.Ha
 		}
 	}
 	consume, err := cons.Consume(func(msg jetstream.Msg) {
-		event := events.Event{
-			ID:    msg.Headers().Get(messageIDHeader),
-			Topic: msg.Subject(),
-			Data:  append([]byte(nil), msg.Data()...),
-		}
-		if err := event.Validate(); err != nil {
-			a.report(fmt.Errorf("invalid event delivery: %w", err))
-			if err := msg.NakWithDelay(a.cfg.RetryDelay); err != nil {
-				a.report(fmt.Errorf("reject invalid delivery: %w", err))
-			}
-			return
-		}
-		if err := ctx.Err(); err != nil {
-			if nakErr := msg.NakWithDelay(a.cfg.RetryDelay); nakErr != nil {
-				a.report(fmt.Errorf("reject canceled delivery: %w", nakErr))
-			}
-			return
-		}
-		if err := handler(ctx, event); err != nil {
-			a.report(fmt.Errorf("handle event %q: %w", event.ID, err))
-			if nakErr := msg.NakWithDelay(a.cfg.RetryDelay); nakErr != nil {
-				a.report(fmt.Errorf("request redelivery of event %q: %w", event.ID, nakErr))
-			}
-			return
-		}
-		if err := msg.DoubleAck(ctx); err != nil {
-			a.report(fmt.Errorf("ack event %q: %w", event.ID, err))
-		}
+		event := eventFromMessage(msg)
+		a.processDelivery(ctx, msg, event, fmt.Sprintf("event %q", event.ID), func() error {
+			return handler(ctx, event)
+		})
 	})
 	if err != nil {
 		return nil, fmt.Errorf("consume JetStream stream %q: %w", a.cfg.Stream, err)
 	}
 	reserved = false
 	return a.registerSubscription(ctx, consume)
+}
+
+// eventFromMessage preserves the transport's opaque event envelope.
+func eventFromMessage(msg jetstream.Msg) events.Event {
+	return events.Event{
+		ID:    msg.Headers().Get(messageIDHeader),
+		Topic: msg.Subject(),
+		Data:  append([]byte(nil), msg.Data()...),
+	}
+}
+
+// processDelivery centralizes validation, cancellation, error reporting,
+// redelivery and confirmed ACK for both normal and replay subscriptions.
+func (a *Adapter) processDelivery(ctx context.Context, msg jetstream.Msg, event events.Event, description string, handle func() error) {
+	if err := event.Validate(); err != nil {
+		a.rejectDelivery(msg, fmt.Errorf("invalid %s: %w", description, err))
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		a.rejectDelivery(msg, fmt.Errorf("%s canceled: %w", description, err))
+		return
+	}
+	if err := handle(); err != nil {
+		a.rejectDelivery(msg, fmt.Errorf("handle %s: %w", description, err))
+		return
+	}
+	if err := msg.DoubleAck(ctx); err != nil {
+		a.report(fmt.Errorf("ack %s: %w", description, err))
+	}
+}
+
+func (a *Adapter) rejectDelivery(msg jetstream.Msg, cause error) {
+	a.report(cause)
+	if err := msg.NakWithDelay(a.cfg.RetryDelay); err != nil {
+		a.report(fmt.Errorf("request redelivery: %w", err))
+	}
 }
 
 // reserveSubscription is held across JetStream consumer lookup, creation and
