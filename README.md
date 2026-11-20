@@ -179,9 +179,9 @@ separate NATS JetStream transport under the existing event contract.
 
 ## Typed in-process notifications
 
-SwarmKit and other in-process systems can publish native Go objects through
-the **same local bus**. No serialization, external broker, second bus, or
-compatibility wrapper is involved:
+In-process applications can publish native Go objects through the
+**same local bus**. This does not require serialization, an external broker,
+or a second bus:
 
 ```go
 sub, err := bus.SubscribeValue(ctx, "swarm.task", func(_ context.Context, value any) error {

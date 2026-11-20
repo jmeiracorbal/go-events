@@ -139,7 +139,10 @@ func TestReplayFailureRedeliveryAndResumeAfterAdapterRestart(t *testing.T) {
 	}
 	defer sub2.Close()
 	event = recvReplay(t, ctx, resumed)
-	if event.Sequence != 2 || event.Event.ID != "replay-2" || event.DeliveryAttempt != 1 {
+	// JetStream may redeliver an unacknowledged message after reconnecting.
+// The durable sequence and acknowledgement, not the attempt count,
+// determine whether its progress was preserved.
+	if event.Sequence != 2 || event.Event.ID != "replay-2" || event.DeliveryAttempt == 0 {
 		t.Fatalf("durable consumer restarted at the wrong position: %+v", event)
 	}
 	waitReplayAck(t, ctx, secondAdapter, "restartable", 2)
