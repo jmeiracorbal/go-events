@@ -176,64 +176,46 @@ func TestMissingStreamFails(t *testing.T) {
 	}
 }
 
+
 func TestExistingDurableConsumerPreservesSettingsAndPendingDelivery(t *testing.T) {
 	url := newServer(t)
 	prepareStream(t, url)
-	nc, err := natsio.Connect(url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	js, err := nc.JetStream()
-	if err != nil {
-		nc.Close()
-		t.Fatal(err)
-	}
-	// Create an ordinary durable subscriber with an AckWait distinct from the
-	// new adapter's configuration. Reattachment must not reset its settings.
-	initialSub, err := js.PullSubscribe("work.created", "persistent-consumer", natsio.BindStream("EVENTS"), natsio.AckWait(7*time.Second))
-	if err != nil {
-		nc.Close()
-		t.Fatal(err)
-	}
-	payload := []byte(`{"id":"persisted-event","project":"existing"}`)
-	msg := &natsio.Msg{
-		Subject: "work.created",
-		Data:    payload,
-		Header:  natsio.Header{},
-	}
-	msg.Header.Set(messageIDHeader, "persisted-event")
-	if _, err := js.PublishMsg(msg); err != nil {
-		nc.Close()
-		t.Fatal(err)
-	}
-	pending, err := initialSub.Fetch(1, natsio.MaxWait(2*time.Second))
-	if err != nil || len(pending) != 1 {
-		nc.Close()
-		t.Fatalf("fetch pending event: count=%d err=%v", len(pending), err)
-	}
-	if pending[0].Header.Get(messageIDHeader) != "persisted-event" {
-		nc.Close()
-		t.Fatal("persisted event does not satisfy the message ID contract")
-	}
-	if err := pending[0].NakWithDelay(25 * time.Millisecond); err != nil {
-		nc.Close()
-		t.Fatal(err)
-	}
-	if err := nc.FlushTimeout(2 * time.Second); err != nil {
-		nc.Close()
-		t.Fatal(err)
-	}
-	nc.Close()
-
 	a := newAdapter(t, url, "persistent-consumer")
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
+
+	cons, err := a.js.CreateConsumer(ctx, "EVENTS", jetstream.ConsumerConfig{
+		Durable: "persistent-consumer", FilterSubject: "work.created",
+		AckPolicy: jetstream.AckExplicitPolicy, AckWait: 7*time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"id":"persisted-event","project":"independent"}`)
+	msg := &natsio.Msg{Subject: "work.created", Data: payload, Header: natsio.Header{}}
+	msg.Header.Set(messageIDHeader, "persisted-event")
+	if _, err := a.js.PublishMsg(ctx, msg); err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := cons.Next(jetstream.FetchMaxWait(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delivery.Headers().Get(messageIDHeader) != "persisted-event" {
+		t.Fatal("persisted message ID changed")
+	}
+	if err := delivery.NakWithDelay(25*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.conn.FlushTimeout(2*time.Second); err != nil {
+		t.Fatal(err)
+	}
 	var attempts atomic.Int32
 	received := make(chan events.Event, 2)
 	sub, err := a.Subscribe(ctx, "work.created", func(_ context.Context, event events.Event) error {
 		received <- event
 		if attempts.Add(1) == 1 {
-			return errors.New("transient storage failure")
+			return errors.New("transient application failure")
 		}
 		return nil
 	})
@@ -245,15 +227,11 @@ func TestExistingDurableConsumerPreservesSettingsAndPendingDelivery(t *testing.T
 		select {
 		case event := <-received:
 			if event.ID != "persisted-event" || event.Topic != "work.created" || string(event.Data) != string(payload) {
-				t.Fatalf("pending delivery changed on attempt %d: %+v", i+1, event)
+				t.Fatalf("durable redelivery changed on attempt %d: %+v", i+1, event)
 			}
 		case <-ctx.Done():
-			t.Fatal("pending delivery was not retried with its original event identity")
+			t.Fatal("durable delivery did not retry with its original identity")
 		}
-	}
-	cons, err := a.js.Consumer(ctx, "EVENTS", "persistent-consumer")
-	if err != nil {
-		t.Fatal(err)
 	}
 	info, err := cons.Info(ctx)
 	if err != nil {
@@ -268,31 +246,19 @@ func TestExistingDurableConsumerPreservesSettingsAndPendingDelivery(t *testing.T
 func TestExistingConsumerWithDifferentFilterIsNotModified(t *testing.T) {
 	url := newServer(t)
 	prepareStream(t, url)
-	nc, err := natsio.Connect(url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	initialJS, err := nc.JetStream()
-	if err != nil {
-		nc.Close()
-		t.Fatal(err)
-	}
-	if _, err := initialJS.PullSubscribe("work.other", "filter-mismatch", natsio.BindStream("EVENTS")); err != nil {
-		nc.Close()
-		t.Fatal(err)
-	}
-	nc.Close()
-
 	a := newAdapter(t, url, "filter-mismatch")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	cons, err := a.js.CreateConsumer(ctx, "EVENTS", jetstream.ConsumerConfig{
+		Durable: "filter-mismatch", FilterSubject: "work.other",
+		AckPolicy: jetstream.AckExplicitPolicy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if sub, err := a.Subscribe(ctx, "work.created", func(context.Context, events.Event) error { return nil }); err == nil {
 		_ = sub.Close()
 		t.Fatal("expected incompatible existing consumer to be rejected")
-	}
-	cons, err := a.js.Consumer(ctx, "EVENTS", "filter-mismatch")
-	if err != nil {
-		t.Fatal(err)
 	}
 	info, err := cons.Info(ctx)
 	if err != nil {
