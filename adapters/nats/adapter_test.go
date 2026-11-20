@@ -272,30 +272,13 @@ func TestExistingConsumerWithDifferentFilterIsNotModified(t *testing.T) {
 func TestDeliveryWithoutMessageIDIsNeverCommitted(t *testing.T) {
 	url := newServer(t)
 	prepareStream(t, url)
-	nc, err := natsio.Connect(url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	js, err := nc.JetStream()
-	if err != nil {
-		nc.Close()
-		t.Fatal(err)
-	}
-	headerlessPayload := []byte(`{"id":"unacknowledged-event","type":"record.created"}`)
-	published, err := js.Publish("work.created", headerlessPayload)
-	if err != nil {
-		nc.Close()
-		t.Fatal(err)
-	}
-	nc.Close()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	reported := make(chan error, 4)
 	var applied atomic.Int32
 	a, err := New(ctx, Config{
 		URL: url, Stream: "EVENTS", Consumer: "invalid-event-consumer",
-		AckWait: time.Second, RetryDelay: 100 * time.Millisecond,
+		AckWait: time.Second, RetryDelay: 100*time.Millisecond,
 		OnError: func(err error) {
 			select {
 			case reported <- err:
@@ -307,6 +290,14 @@ func TestDeliveryWithoutMessageIDIsNeverCommitted(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Close()
+
+	// A record written outside the event contract must never be acknowledged.
+	// The transport must not infer an ID from the opaque payload.
+	payload := []byte(`{"id":"not-a-wire-id","type":"record.created"}`)
+	pub, err := a.js.PublishMsg(ctx, &natsio.Msg{Subject: "work.created", Data: payload})
+	if err != nil {
+		t.Fatal(err)
+	}
 	sub, err := a.Subscribe(ctx, "work.created", func(context.Context, events.Event) error {
 		applied.Add(1)
 		return nil
@@ -321,32 +312,31 @@ func TestDeliveryWithoutMessageIDIsNeverCommitted(t *testing.T) {
 			t.Fatalf("incorrect error for missing message ID: %v", err)
 		}
 	case <-ctx.Done():
-		t.Fatal("missing message ID did not fail visibly")
+		t.Fatal("invalid event was not rejected visibly")
 	}
 	if err := sub.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if applied.Load() != 0 {
-		t.Fatalf("unidentified message reached application handler %d times", applied.Load())
+		t.Fatalf("invalid event reached application handler %d times", applied.Load())
 	}
 
-	check, err := natsio.Connect(url)
+	stream, err := a.js.Stream(ctx, "EVENTS")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer check.Close()
-	checkJS, err := check.JetStream()
+	stored, err := stream.GetMsg(ctx, pub.Sequence)
 	if err != nil {
 		t.Fatal(err)
 	}
-	stored, err := checkJS.GetMsg("EVENTS", published.Sequence)
+	if string(stored.Data) != string(payload) || stored.Header.Get(messageIDHeader) != "" {
+		t.Fatal("invalid stored event was changed or deleted")
+	}
+	cons, err := a.js.Consumer(ctx, "EVENTS", "invalid-event-consumer")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(stored.Data) != string(headerlessPayload) || stored.Header.Get(messageIDHeader) != "" {
-		t.Fatal("invalid event was rewritten or deleted")
-	}
-	info, err := checkJS.ConsumerInfo("EVENTS", "invalid-event-consumer")
+	info, err := cons.Info(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
