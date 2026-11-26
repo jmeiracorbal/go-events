@@ -161,7 +161,7 @@ func (a *Adapter) Subscribe(ctx context.Context, topic string, handler events.Ha
 		if err != nil {
 			return nil, fmt.Errorf("inspect durable consumer %q: %w", a.cfg.Consumer, err)
 		}
-		if info.Config.FilterSubject != topic || info.Config.AckPolicy != jetstream.AckExplicitPolicy || info.Config.DeliverSubject != "" {
+		if info.Config.Durable != a.cfg.Consumer || info.Config.FilterSubject != topic || info.Config.AckPolicy != jetstream.AckExplicitPolicy || info.Config.DeliverSubject != "" {
 			return nil, fmt.Errorf("durable consumer %q has an incompatible delivery configuration", a.cfg.Consumer)
 		}
 	}
@@ -215,8 +215,8 @@ func (a *Adapter) rejectDelivery(msg jetstream.Msg, cause error) {
 }
 
 // reserveSubscription is held across JetStream consumer lookup, creation and
-// Consume setup. A competing Subscribe or Replay must not create a durable
-// consumer that it will not be permitted to use.
+// Consume setup. Competing subscriptions must not create consumers that
+// they will not be permitted to use.
 func (a *Adapter) reserveSubscription() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
