@@ -76,3 +76,13 @@ type ReplayHandler func(context.Context, StoredEvent) error
 type ReplaySubscriber interface {
 	Replay(context.Context, Cursor, string, string, ReplayHandler) (Subscription, error)
 }
+
+// EphemeralReplaySubscriber is an optional capability for session-scoped
+// replay. Every invocation starts from the supplied cursor using a new
+// temporary broker consumer. It never resumes another session's ACK progress.
+// The subscription is removed when closed; inactivityTimeout bounds abandoned
+// consumer lifetime when a session cannot close cleanly. As with Replay,
+// delivery is at least once and UpperBound does not stop live delivery.
+type EphemeralReplaySubscriber interface {
+	ReplayEphemeral(context.Context, Cursor, string, time.Duration, ReplayHandler) (Subscription, error)
+}

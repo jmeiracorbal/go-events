@@ -5,7 +5,7 @@ Small event contracts for Go applications, with separate local and durable trans
 ## Transports
 
 - `adapters/local` dispatches to in-process subscribers synchronously. It does not persist or retry events.
-- `adapters/nats` publishes to an existing NATS JetStream stream and uses named durable pull consumers. Successful handlers are acknowledged; failed handlers are negatively acknowledged with a configured retry delay.
+- `adapters/nats` publishes to an existing NATS JetStream stream and supports durable pull consumers and session-scoped ephemeral replay. Successful handlers are acknowledged; failed handlers are negatively acknowledged with a configured retry delay.
 
 Applications choose the transport explicitly. The core package does not import NATS or contain application-specific types.
 
@@ -138,12 +138,55 @@ limit of recoverable history; it is not an exactly-once guarantee.
 `Cursor.UpperBound` limits `Read` only; `Replay` intentionally continues
 past it. If a new consumer starts from a saved cursor, intervening events are
 replayed as long as JetStream still retains them. Each adapter instance
-supports one active `Subscribe` or `Replay` subscription, and a durable
+supports one active `Subscribe`, `Replay` or `ReplayEphemeral` subscription, and a durable
 name must not be reused across independently acknowledged subscribers.
 
 A runnable example is available at [examples/replay](examples/replay);
 it requires an existing NATS JetStream stream and explicit connection,
 stream, subject and consumer environment variables.
+
+### Session-scoped ephemeral replay
+
+For consumers that rebuild their state for each session, the optional
+`events.EphemeralReplaySubscriber` capability creates a new temporary broker
+consumer. It does not use or update another subscription's durable position.
+
+```go
+sub, err := adapter.ReplayEphemeral(
+    ctx,
+    events.Cursor{Stream: "EVENTS", AfterSequence: 41},
+    "task.>",
+    time.Minute,
+    func(ctx context.Context, stored events.StoredEvent) error {
+        return projectEvent(ctx, stored.Event.ID, stored.Event.Data)
+    },
+)
+if err != nil {
+    return err
+}
+// Check the result of Close to detect broker cleanup failures.
+defer sub.Close()
+```
+
+The cursor, subject filter, at-least-once delivery, explicit ACK/NAK, and
+`StoredEvent` metadata use the same implementation as durable replay. Each
+invocation starts at the supplied cursor, and the snapshot upper bound does
+not stop live delivery. A positive inactivity timeout is mandatory. The
+adapter uses an anonymous JetStream pull consumer and explicitly deletes it
+on subscription close, context cancellation, or adapter close. Cleanup
+failures are returned by explicit close and reported through `Config.OnError`
+on cancellation. JetStream also expires abandoned consumers after their
+configured inactivity period, including when the client loses its connection
+or the creation response. This is broker-managed inactivity, not a wall-clock
+session deadline. A new session never inherits previous ACK progress.
+
+Ephemeral replay requires a stream with Limits retention; otherwise ACK or
+consumer removal could affect the availability of historical messages. Existing
+durable consumers are neither reconfigured nor deleted. Retention can still
+remove history, and events can be redelivered; consumers must handle these
+conditions explicitly. No database or transport-specific state is exposed in
+the public interface. Configure `OnError` to observe transport and handler
+errors.
 
 ## Local watches
 
