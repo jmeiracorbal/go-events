@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	events "github.com/jmeiracorbal/go-events"
 	"github.com/nats-io/nats.go/jetstream"
@@ -14,7 +15,10 @@ import (
 // JetStream owns the durable cursor and the pending ACK state.
 const replayMaxPendingMessages = 64
 
-var _ events.ReplaySubscriber = (*Adapter)(nil)
+var (
+	_ events.ReplaySubscriber = (*Adapter)(nil)
+	_ events.EphemeralReplaySubscriber = (*Adapter)(nil)
+)
 
 // Replay consumes retained events strictly after the supplied stream sequence
 // and continues with newly published events using a single durable JetStream
@@ -24,6 +28,24 @@ var _ events.ReplaySubscriber = (*Adapter)(nil)
 // A zero-value cursor starts at the first event still retained. A cursor from
 // Read may include UpperBound; that snapshot bound does not limit Replay.
 func (a *Adapter) Replay(ctx context.Context, from events.Cursor, subject, consumer string, handler events.ReplayHandler) (events.Subscription, error) {
+	if consumer == "" || strings.TrimSpace(consumer) != consumer || strings.ContainsAny(consumer, " \t\r\n") {
+		return nil, errors.New("replay durable consumer name is required without whitespace")
+	}
+	return a.replay(ctx, from, subject, consumer, 0, handler)
+}
+
+// ReplayEphemeral uses a new temporary consumer for each session. The broker
+// removes abandoned consumers after inactivityTimeout; normal closure deletes
+// the consumer explicitly. Limits retention is required so ACK and deletion
+// cannot consume the underlying historical data.
+func (a *Adapter) ReplayEphemeral(ctx context.Context, from events.Cursor, subject string, inactivityTimeout time.Duration, handler events.ReplayHandler) (events.Subscription, error) {
+	if inactivityTimeout <= 0 {
+		return nil, errors.New("replay inactivity timeout must be positive")
+	}
+	return a.replay(ctx, from, subject, "", inactivityTimeout, handler)
+}
+
+func (a *Adapter) replay(ctx context.Context, from events.Cursor, subject, durable string, inactivityTimeout time.Duration, handler events.ReplayHandler) (events.Subscription, error) {
 	if ctx == nil {
 		return nil, errors.New("replay context is required")
 	}
@@ -32,9 +54,6 @@ func (a *Adapter) Replay(ctx context.Context, from events.Cursor, subject, consu
 	}
 	if err := validateHistorySubject(subject); err != nil {
 		return nil, err
-	}
-	if consumer == "" || strings.TrimSpace(consumer) != consumer || strings.ContainsAny(consumer, " \t\r\n") {
-		return nil, errors.New("replay durable consumer name is required without whitespace")
 	}
 	if handler == nil {
 		return nil, errors.New("replay handler is required")
@@ -51,7 +70,6 @@ func (a *Adapter) Replay(ctx context.Context, from events.Cursor, subject, consu
 	if from.UpperBound != 0 && from.AfterSequence > from.UpperBound {
 		return nil, fmt.Errorf("%w: position %d exceeds snapshot upper bound %d", events.ErrInvalidCursor, from.AfterSequence, from.UpperBound)
 	}
-
 	if err := a.reserveSubscription(); err != nil {
 		return nil, err
 	}
@@ -62,55 +80,20 @@ func (a *Adapter) Replay(ctx context.Context, from events.Cursor, subject, consu
 		}
 	}()
 
-	cons, err := a.js.Consumer(ctx, a.cfg.Stream, consumer)
-	switch {
-	case errors.Is(err, jetstream.ErrConsumerNotFound):
-		// Only a new durable consumer uses the caller's starting cursor.
-		// Existing consumers own their delivery progress on the server.
-		stream, streamErr := a.historyStream(ctx)
-		if streamErr != nil {
-			return nil, streamErr
-		}
-		info, infoErr := stream.Info(ctx)
-		if infoErr != nil {
-			return nil, historyError("inspect stream before replay", infoErr)
-		}
-		if from.AfterSequence > info.State.LastSeq || from.UpperBound > info.State.LastSeq {
-			return nil, fmt.Errorf("%w: cursor is beyond stream last sequence %d", events.ErrInvalidCursor, info.State.LastSeq)
-		}
-		if from.AfterSequence > 0 && info.State.FirstSeq > 0 && from.AfterSequence < info.State.FirstSeq-1 {
-			return nil, fmt.Errorf("%w: position %d predates first retained sequence %d", events.ErrHistoryExpired, from.AfterSequence, info.State.FirstSeq)
-		}
-		start := uint64(1)
-		if from.AfterSequence != 0 {
-			start = from.AfterSequence + 1
-		} else if info.State.FirstSeq != 0 {
-			start = info.State.FirstSeq
-		}
-		cons, err = a.js.CreateConsumer(ctx, a.cfg.Stream, jetstream.ConsumerConfig{
-			Durable:       consumer,
-			FilterSubject: subject,
-			AckPolicy:     jetstream.AckExplicitPolicy,
-			AckWait:       a.cfg.AckWait,
-			DeliverPolicy: jetstream.DeliverByStartSequencePolicy,
-			OptStartSeq:   start,
-			MaxAckPending: replayMaxPendingMessages,
-		})
+	var cons jetstream.Consumer
+	var err error
+	var cleanup func() error
+	if durable == "" {
+		cons, err = a.createReplayConsumer(ctx, from, subject, "", inactivityTimeout)
 		if err != nil {
-			return nil, historyError(fmt.Sprintf("create replay consumer %q", consumer), err)
+			return nil, err
 		}
-	case err != nil:
-		return nil, historyError(fmt.Sprintf("open replay consumer %q", consumer), err)
-	default:
-		info, infoErr := cons.Info(ctx)
-		if infoErr != nil {
-			return nil, historyError(fmt.Sprintf("inspect replay consumer %q", consumer), infoErr)
-		}
-		if info.Config.FilterSubject != subject ||
-			info.Config.AckPolicy != jetstream.AckExplicitPolicy ||
-			info.Config.DeliverPolicy != jetstream.DeliverByStartSequencePolicy ||
-			info.Config.DeliverSubject != "" {
-			return nil, fmt.Errorf("%w: durable consumer %q in stream %q", events.ErrConsumerIncompatible, consumer, a.cfg.Stream)
+		name := cons.CachedInfo().Name
+		cleanup = func() error { return a.deleteReplayConsumer(name) }
+	} else {
+		cons, err = a.durableReplayConsumer(ctx, from, subject, durable)
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -138,9 +121,87 @@ func (a *Adapter) Replay(ctx context.Context, from events.Cursor, subject, consu
 		a.report(fmt.Errorf("consume replay stream %q: %w", a.cfg.Stream, err))
 	}))
 	if err != nil {
+		if cleanup != nil {
+			err = errors.Join(err, cleanup())
+		}
 		return nil, historyError(fmt.Sprintf("consume replay stream %q", a.cfg.Stream), err)
 	}
 	reserved = false
-	return a.registerSubscription(ctx, consume)
+	return a.registerSubscription(ctx, consume, cleanup)
 }
 
+func (a *Adapter) durableReplayConsumer(ctx context.Context, from events.Cursor, subject, name string) (jetstream.Consumer, error) {
+	cons, err := a.js.Consumer(ctx, a.cfg.Stream, name)
+	switch {
+	case errors.Is(err, jetstream.ErrConsumerNotFound):
+		return a.createReplayConsumer(ctx, from, subject, name, 0)
+	case err != nil:
+		return nil, historyError(fmt.Sprintf("open replay consumer %q", name), err)
+	default:
+		info, err := cons.Info(ctx)
+		if err != nil {
+			return nil, historyError(fmt.Sprintf("inspect replay consumer %q", name), err)
+		}
+		if info.Config.FilterSubject != subject ||
+			info.Config.AckPolicy != jetstream.AckExplicitPolicy ||
+			info.Config.DeliverPolicy != jetstream.DeliverByStartSequencePolicy ||
+			info.Config.DeliverSubject != "" || info.Config.Durable != name {
+			return nil, fmt.Errorf("%w: durable consumer %q in stream %q", events.ErrConsumerIncompatible, name, a.cfg.Stream)
+		}
+		return cons, nil
+	}
+}
+
+// Only new consumers use the supplied cursor. Both lifecycles share the
+// retained sequence validation and delivery configuration.
+func (a *Adapter) createReplayConsumer(ctx context.Context, from events.Cursor, subject, durable string, inactivityTimeout time.Duration) (jetstream.Consumer, error) {
+	stream, err := a.historyStream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	info, err := stream.Info(ctx)
+	if err != nil {
+		return nil, historyError("inspect stream before replay", err)
+	}
+	if durable == "" && info.Config.Retention != jetstream.LimitsPolicy {
+		return nil, errors.New("ephemeral replay requires limits retention")
+	}
+	if from.AfterSequence > info.State.LastSeq || from.UpperBound > info.State.LastSeq {
+		return nil, fmt.Errorf("%w: cursor is beyond stream last sequence %d", events.ErrInvalidCursor, info.State.LastSeq)
+	}
+	if from.AfterSequence > 0 && info.State.FirstSeq > 0 && from.AfterSequence < info.State.FirstSeq-1 {
+		return nil, fmt.Errorf("%w: position %d predates first retained sequence %d", events.ErrHistoryExpired, from.AfterSequence, info.State.FirstSeq)
+	}
+	start := uint64(1)
+	if from.AfterSequence != 0 {
+		start = from.AfterSequence + 1
+	} else if info.State.FirstSeq != 0 {
+		start = info.State.FirstSeq
+	}
+	cons, err := a.js.CreateConsumer(ctx, a.cfg.Stream, jetstream.ConsumerConfig{
+		Durable: durable,
+		FilterSubject: subject,
+		AckPolicy: jetstream.AckExplicitPolicy,
+		AckWait: a.cfg.AckWait,
+		DeliverPolicy: jetstream.DeliverByStartSequencePolicy,
+		OptStartSeq: start,
+		MaxAckPending: replayMaxPendingMessages,
+		InactiveThreshold: inactivityTimeout,
+	})
+	if err != nil {
+		return nil, historyError("create replay consumer", err)
+	}
+	return cons, nil
+}
+
+func (a *Adapter) deleteReplayConsumer(name string) error {
+	// Closing may be triggered by cancellation of the session context.
+	// Cleanup therefore has an independent, bounded deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := a.js.DeleteConsumer(ctx, a.cfg.Stream, name)
+	if err != nil && !errors.Is(err, jetstream.ErrConsumerNotFound) {
+		return historyError(fmt.Sprintf("delete ephemeral replay consumer %q", name), err)
+	}
+	return nil
+}
