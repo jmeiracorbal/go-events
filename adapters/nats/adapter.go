@@ -34,7 +34,7 @@ type Adapter struct {
 	js     jetstream.JetStream
 	mu       sync.Mutex
 	subs     map[*subscription]struct{}
-	starting bool
+	starting chan struct{}
 	closed   bool
 }
 
@@ -43,6 +43,8 @@ type subscription struct {
 	consume jetstream.ConsumeContext
 	done    chan struct{}
 	once    sync.Once
+	cleanup func() error
+	closeErr error
 }
 
 var (
@@ -173,7 +175,7 @@ func (a *Adapter) Subscribe(ctx context.Context, topic string, handler events.Ha
 		return nil, fmt.Errorf("consume JetStream stream %q: %w", a.cfg.Stream, err)
 	}
 	reserved = false
-	return a.registerSubscription(ctx, consume)
+	return a.registerSubscription(ctx, consume, nil)
 }
 
 // eventFromMessage preserves the transport's opaque event envelope.
@@ -221,10 +223,10 @@ func (a *Adapter) reserveSubscription() error {
 	if a.closed {
 		return events.ErrClosed
 	}
-	if a.starting || len(a.subs) != 0 {
+	if a.starting != nil || len(a.subs) != 0 {
 		return errors.New("NATS adapter already has an active subscriber")
 	}
-	a.starting = true
+	a.starting = make(chan struct{})
 	return nil
 }
 
@@ -232,31 +234,36 @@ func (a *Adapter) reserveSubscription() error {
 // The successful path transfers the reservation to registerSubscription.
 func (a *Adapter) releaseSubscriptionReservation() {
 	a.mu.Lock()
-	a.starting = false
+	close(a.starting)
+	a.starting = nil
 	a.mu.Unlock()
 }
 
-// registerSubscription tracks the lifetime of a live JetStream consume loop.
-// Each Adapter has one active subscription at a time, regardless of whether it
-// originated from Subscribe or Replay. Closing it retains the durable consumer.
-func (a *Adapter) registerSubscription(ctx context.Context, consume jetstream.ConsumeContext) (events.Subscription, error) {
-	s := &subscription{adapter: a, consume: consume, done: make(chan struct{})}
+// registerSubscription transfers the reservation to an active consume loop.
+// Only session-scoped subscriptions own a broker cleanup operation.
+func (a *Adapter) registerSubscription(ctx context.Context, consume jetstream.ConsumeContext, cleanup func() error) (events.Subscription, error) {
+	s := &subscription{adapter: a, consume: consume, done: make(chan struct{}), cleanup: cleanup}
 	a.mu.Lock()
-	a.starting = false
 	if a.closed || len(a.subs) != 0 {
+		closed := a.closed
 		a.mu.Unlock()
-		consume.Stop()
-		if a.closed {
-			return nil, events.ErrClosed
+		err := s.Close()
+		a.releaseSubscriptionReservation()
+		if closed {
+			return nil, errors.Join(events.ErrClosed, err)
 		}
-		return nil, errors.New("NATS adapter already has an active subscriber")
+		return nil, errors.Join(errors.New("NATS adapter already has an active subscriber"), err)
 	}
 	a.subs[s] = struct{}{}
+	close(a.starting)
+	a.starting = nil
 	a.mu.Unlock()
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = s.Close()
+			if err := s.Close(); err != nil {
+				a.report(err)
+			}
 		case <-s.done:
 		}
 	}()
@@ -271,13 +278,16 @@ func (a *Adapter) report(err error) {
 
 func (s *subscription) Close() error {
 	s.once.Do(func() {
-		close(s.done)
 		s.consume.Stop()
+		if s.cleanup != nil {
+			s.closeErr = s.cleanup()
+		}
 		s.adapter.mu.Lock()
 		delete(s.adapter.subs, s)
 		s.adapter.mu.Unlock()
+		close(s.done)
 	})
-	return nil
+	return s.closeErr
 }
 
 func (a *Adapter) Close() error {
@@ -287,14 +297,22 @@ func (a *Adapter) Close() error {
 		return nil
 	}
 	a.closed = true
+	starting := a.starting
+	a.mu.Unlock()
+	// Let in-flight setup release its consumer before closing the connection.
+	if starting != nil {
+		<-starting
+	}
+	a.mu.Lock()
 	subs := make([]*subscription, 0, len(a.subs))
 	for sub := range a.subs {
 		subs = append(subs, sub)
 	}
 	a.mu.Unlock()
+	var err error
 	for _, sub := range subs {
-		_ = sub.Close()
+		err = errors.Join(err, sub.Close())
 	}
 	a.conn.Close()
-	return nil
+	return err
 }
