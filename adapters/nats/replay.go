@@ -52,7 +52,7 @@ func (a *Adapter) replay(ctx context.Context, from events.Cursor, subject, durab
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := validateHistorySubject(subject); err != nil {
+	if err := validateSubjectPattern(subject); err != nil {
 		return nil, err
 	}
 	if handler == nil {
@@ -133,6 +133,15 @@ func (a *Adapter) durableReplayConsumer(ctx context.Context, from events.Cursor,
 	case err != nil:
 		return nil, historyError(fmt.Sprintf("open replay consumer %q", name), err)
 	default:
+		if !from.StreamCreated.IsZero() {
+			stream, err := a.openStream(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if err := validateStreamIdentity(from, stream.CachedInfo()); err != nil {
+				return nil, err
+			}
+		}
 		info, err := cons.Info(ctx)
 		if err != nil {
 			return nil, historyError(fmt.Sprintf("inspect replay consumer %q", name), err)
@@ -150,14 +159,11 @@ func (a *Adapter) durableReplayConsumer(ctx context.Context, from events.Cursor,
 // Only new consumers use the supplied cursor. Both lifecycles share the
 // retained sequence validation and delivery configuration.
 func (a *Adapter) createReplayConsumer(ctx context.Context, from events.Cursor, subject, durable string, inactivityTimeout time.Duration) (jetstream.Consumer, error) {
-	stream, err := a.historyStream(ctx)
+	stream, err := a.openStream(ctx)
 	if err != nil {
 		return nil, err
 	}
-	info, err := stream.Info(ctx)
-	if err != nil {
-		return nil, historyError("inspect stream before replay", err)
-	}
+	info := stream.CachedInfo()
 	if err := validateStreamIdentity(from, info); err != nil {
 		return nil, err
 	}

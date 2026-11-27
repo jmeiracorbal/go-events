@@ -60,6 +60,9 @@ func TestCoversSubjectChecksFullPattern(t *testing.T) {
 		{[]string{"work.>"}, "work.created", true},
 		{[]string{"work.>"}, "work", false},
 		{[]string{"work.*"}, "work.>", false},
+		{[]string{"work.*", "work.*.>"}, "work.>", true},
+		{[]string{"work.*", "work.*.*.>"}, "work.>", false},
+		{[]string{"work.*", "work.*.*", "work.*.*.>"}, "work.>", true},
 		{[]string{"work.*.>"}, "work.>", false},
 		{[]string{"work.*.>"}, "work.*.done", true},
 		{[]string{"work.created", "work.updated"}, "work.*", false},
@@ -183,6 +186,14 @@ func TestCapturedEmptyHistoryDoesNotExpandOrSkipRetention(t *testing.T) {
 	same, err := a.Read(ctx, events.ReadQuery{Subject: "work.>", Cursor: page.Next, Limit: 1})
 	if err != nil || len(same.Events) != 0 || same.Next.UpperBound != 0 {
 		t.Fatalf("empty captured window expanded: %+v, %v", same, err)
+	}
+	incomplete := page.Next
+	incomplete.StreamCreated = time.Time{}
+	if _, err := a.Read(ctx, events.ReadQuery{Subject: "work.>", Cursor: incomplete, Limit: 1}); !errors.Is(err, events.ErrInvalidCursor) {
+		t.Fatalf("incomplete snapshot accepted: %v", err)
+	}
+	if _, err := a.Read(ctx, events.ReadQuery{Subject: "work.>", Cursor: events.Cursor{Stream: "EVENTS", AfterSequence: 1}, Limit: 1}); !errors.Is(err, events.ErrInvalidCursor) {
+		t.Fatalf("reconstructed history cursor accepted: %v", err)
 	}
 	if _, err := a.Read(ctx, events.ReadQuery{Subject: "work.created", Cursor: page.Next, Limit: 1}); !errors.Is(err, events.ErrInvalidCursor) {
 		t.Fatalf("changed cursor subject accepted: %v", err)

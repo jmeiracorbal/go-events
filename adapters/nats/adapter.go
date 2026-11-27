@@ -95,6 +95,12 @@ func (a *Adapter) Publish(ctx context.Context, event events.Event) error {
 	if err := event.Validate(); err != nil {
 		return err
 	}
+	if err := validatePublishSubject(event.Topic); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	a.mu.Lock()
 	closed := a.closed
 	a.mu.Unlock()
@@ -107,12 +113,6 @@ func (a *Adapter) Publish(ctx context.Context, event events.Event) error {
 		Header:  natsio.Header{},
 	}
 	msg.Header.Set(messageIDHeader, event.ID)
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := validatePublishSubject(event.Topic); err != nil {
-		return err
-	}
 	ack, err := a.js.PublishMsg(ctx, msg, jetstream.WithExpectStream(a.cfg.Stream))
 	if err != nil {
 		return fmt.Errorf("publish event %q: %w", event.ID, err)
@@ -132,7 +132,7 @@ func (a *Adapter) Subscribe(ctx context.Context, topic string, handler events.Ha
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := validateHistorySubject(topic); err != nil {
+	if err := validateSubjectPattern(topic); err != nil {
 		return nil, err
 	}
 	if handler == nil {

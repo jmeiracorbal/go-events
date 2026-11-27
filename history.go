@@ -35,7 +35,8 @@ type StoredEvent struct {
 // Read returns a cursor bound to its normalized subject (including ">" for
 // all subjects) and stream creation time. A nonempty Subject identifies a
 // captured snapshot even when UpperBound is zero. Pass the returned cursor
-// unchanged to subsequent reads or replay of the same subject.
+// unchanged to subsequent reads or replay of the same subject. A nonzero
+// cursor passed to Read must have complete captured snapshot identity.
 type Cursor struct {
 	Stream        string
 	AfterSequence uint64

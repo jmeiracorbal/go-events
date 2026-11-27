@@ -53,14 +53,11 @@ type StreamInfo struct {
 // InspectStream reads current broker metadata without fetching events,
 // creating consumers or changing broker configuration.
 func (a *Adapter) InspectStream(ctx context.Context) (StreamInfo, error) {
-	stream, err := a.historyStream(ctx)
+	stream, err := a.openStream(ctx)
 	if err != nil {
 		return StreamInfo{}, err
 	}
 	info := stream.CachedInfo()
-	if info == nil {
-		return StreamInfo{}, fmt.Errorf("stream metadata unavailable")
-	}
 	var retention RetentionPolicy
 	switch info.Config.Retention {
 	case jetstream.LimitsPolicy:
@@ -101,36 +98,61 @@ func (a *Adapter) InspectStream(ctx context.Context) (StreamInfo, error) {
 // not proof of authorization, successful publication, or unchanged subjects
 // after a server-side transformation.
 func (s StreamInfo) CoversSubject(required string) (bool, error) {
-	if err := validateHistorySubject(required); err != nil {
+	if err := validateSubjectPattern(required); err != nil {
 		return false, err
 	}
 	want := strings.Split(required, ".")
-	covered := false
+	patterns := make([][]string, 0, len(s.Subjects))
+	maxLength := len(want)
 	for _, subject := range s.Subjects {
-		if err := validateHistorySubject(subject); err != nil {
+		if err := validateSubjectPattern(subject); err != nil {
 			return false, err
 		}
-		if coversPattern(strings.Split(subject, "."), want) {
-			covered = true
+		tokens := strings.Split(subject, ".")
+		patterns = append(patterns, tokens)
+		maxLength = max(maxLength, len(tokens))
+	}
+	if want[len(want)-1] != ">" {
+		return coversLength(patterns, want), nil
+	}
+
+	// A trailing > matches one or more tokens. Check every finite length
+	// where coverage can change, and one beyond all configured prefixes.
+	prefix := want[:len(want)-1]
+	for length := len(want); length <= maxLength+1; length++ {
+		concrete := make([]string, length)
+		copy(concrete, prefix)
+		for j := len(prefix); j < length; j++ {
+			concrete[j] = "*"
+		}
+		if !coversLength(patterns, concrete) {
+			return false, nil
 		}
 	}
-	return covered, nil
+	return true, nil
 }
 
-func coversPattern(configured, required []string) bool {
-	for i, token := range configured {
-		if i >= len(required) {
-			return false
+// At a fixed length a finite union of literal tokens cannot cover an
+// arbitrary wildcard token. At least one pattern must cover all tokens.
+func coversLength(patterns [][]string, required []string) bool {
+	for _, pattern := range patterns {
+		matched := true
+		for j, token := range pattern {
+			if j >= len(required) {
+				matched = false
+				break
+			}
+			if token == ">" {
+				return true
+			}
+			if token != "*" && token != required[j] {
+				matched = false
+				break
+			}
 		}
-		if token == ">" {
+		if matched && len(pattern) == len(required) {
 			return true
 		}
-		if required[i] == ">" {
-			return false
-		}
-		if token != "*" && token != required[i] {
-			return false
-		}
 	}
-	return len(configured) == len(required)
+	return false
 }

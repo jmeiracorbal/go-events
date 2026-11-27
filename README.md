@@ -92,9 +92,10 @@ The first page captures an inclusive `Cursor.UpperBound`; later pages retain
 the same bound even when new events are published. `AfterSequence` is
 exclusive. A returned cursor also binds the normalized subject and stream
 creation time, including an empty snapshot at sequence zero. Pass it unchanged
-for subsequent reads or replay of the same subject. Explicitly constructed
-positions without this metadata remain supported, but cannot detect a changed
-stream incarnation or filter. A zero cursor starts at the
+for subsequent reads or replay of the same subject. History pagination rejects
+positions without complete snapshot identity. Explicit starting positions for
+replay remain a distinct public capability; they do not identify an earlier
+snapshot. A zero cursor starts at the
 earliest retained message. Deleted sequences are skipped, and a saved cursor
 that falls outside the stream retention window returns
 `events.ErrHistoryExpired`. A paginated read is **not** a transactional
