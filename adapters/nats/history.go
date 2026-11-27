@@ -40,16 +40,15 @@ func (a *Adapter) Read(ctx context.Context, query events.ReadQuery) (events.Even
 	if query.Limit <= 0 || query.Limit > events.MaxHistoryPageSize {
 		return events.EventPage{}, fmt.Errorf("history page limit must be between 1 and %d", events.MaxHistoryPageSize)
 	}
-	if query.Subject != "" {
-		if err := validateHistorySubject(query.Subject); err != nil {
-			return events.EventPage{}, err
-		}
+	subject := query.Subject
+	if subject == "" {
+		subject = ">"
 	}
-	if query.Cursor.Stream == "" && (query.Cursor.AfterSequence != 0 || query.Cursor.UpperBound != 0) {
-		return events.EventPage{}, fmt.Errorf("%w: positioned cursor must identify its stream", events.ErrInvalidCursor)
+	if err := validateHistorySubject(subject); err != nil {
+		return events.EventPage{}, err
 	}
-	if query.Cursor.Stream != "" && query.Cursor.Stream != a.cfg.Stream {
-		return events.EventPage{}, fmt.Errorf("%w: cursor stream %q does not match %q", events.ErrInvalidCursor, query.Cursor.Stream, a.cfg.Stream)
+	if err := validateCursor(query.Cursor, a.cfg.Stream, subject); err != nil {
+		return events.EventPage{}, err
 	}
 	stream, err := a.historyStream(ctx)
 	if err != nil {
@@ -60,8 +59,11 @@ func (a *Adapter) Read(ctx context.Context, query events.ReadQuery) (events.Even
 		return events.EventPage{}, historyError("inspect stream history", err)
 	}
 
+	if err := validateStreamIdentity(query.Cursor, info); err != nil {
+		return events.EventPage{}, err
+	}
 	bound := query.Cursor.UpperBound
-	if bound == 0 {
+	if bound == 0 && query.Cursor.Subject == "" {
 		bound = info.State.LastSeq
 	} else if bound > info.State.LastSeq {
 		return events.EventPage{}, fmt.Errorf("%w: upper bound %d exceeds current stream sequence %d", events.ErrInvalidCursor, bound, info.State.LastSeq)
@@ -69,23 +71,24 @@ func (a *Adapter) Read(ctx context.Context, query events.ReadQuery) (events.Even
 	if query.Cursor.AfterSequence > bound {
 		return events.EventPage{}, fmt.Errorf("%w: position %d exceeds upper bound %d", events.ErrInvalidCursor, query.Cursor.AfterSequence, bound)
 	}
-	if query.Cursor.AfterSequence != 0 && info.State.FirstSeq > 0 && query.Cursor.AfterSequence < info.State.FirstSeq-1 {
-		return events.EventPage{}, fmt.Errorf("%w: position %d predates first retained sequence %d", events.ErrHistoryExpired, query.Cursor.AfterSequence, info.State.FirstSeq)
+	if query.Cursor.AfterSequence < bound {
+		if err := validateRetention(query.Cursor, info); err != nil {
+			return events.EventPage{}, err
+		}
 	}
 
-	cursor := events.Cursor{Stream: a.cfg.Stream, AfterSequence: bound, UpperBound: bound}
+	cursor := events.Cursor{
+		Stream: a.cfg.Stream, AfterSequence: bound, UpperBound: bound,
+		Subject: subject, StreamCreated: info.Created,
+	}
 	page := events.EventPage{Events: make([]events.StoredEvent, 0, query.Limit), Next: cursor}
 	if info.State.Msgs == 0 || query.Cursor.AfterSequence == bound {
 		return page, nil
 	}
 
 	next := query.Cursor.AfterSequence + 1
-	if query.Cursor.AfterSequence == 0 && next < info.State.FirstSeq {
+	if query.Cursor.AfterSequence == 0 && query.Cursor.Subject == "" && next < info.State.FirstSeq {
 		next = info.State.FirstSeq
-	}
-	subject := query.Subject
-	if subject == "" {
-		subject = ">"
 	}
 	for next <= bound {
 		if err := ctx.Err(); err != nil {
@@ -96,6 +99,9 @@ func (a *Adapter) Read(ctx context.Context, query events.ReadQuery) (events.Even
 			current, infoErr := stream.Info(ctx)
 			if infoErr != nil {
 				return events.EventPage{}, historyError("check history retention", infoErr)
+			}
+			if err := validateStreamIdentity(cursor, current); err != nil {
+				return events.EventPage{}, err
 			}
 			if current.State.FirstSeq > next && next <= bound {
 				return events.EventPage{}, fmt.Errorf("%w: sequence %d predates first retained sequence %d", events.ErrHistoryExpired, next, current.State.FirstSeq)
@@ -120,6 +126,38 @@ func (a *Adapter) Read(ctx context.Context, query events.ReadQuery) (events.Even
 		next = msg.Sequence + 1
 	}
 	return page, nil
+}
+
+// validateCursor also accepts explicitly constructed positions without a
+// captured subject or creation time, preserving the public positioning API.
+func validateCursor(cursor events.Cursor, stream, subject string) error {
+	if cursor.Stream == "" && (cursor.AfterSequence != 0 || cursor.UpperBound != 0 || cursor.Subject != "" || !cursor.StreamCreated.IsZero()) {
+		return fmt.Errorf("%w: positioned cursor must identify its stream", events.ErrInvalidCursor)
+	}
+	if cursor.Stream != "" && cursor.Stream != stream {
+		return fmt.Errorf("%w: cursor stream %q does not match %q", events.ErrInvalidCursor, cursor.Stream, stream)
+	}
+	if cursor.Subject != "" && cursor.Subject != subject {
+		return fmt.Errorf("%w: cursor subject %q does not match %q", events.ErrInvalidCursor, cursor.Subject, subject)
+	}
+	return nil
+}
+
+func validateStreamIdentity(cursor events.Cursor, info *jetstream.StreamInfo) error {
+	if !cursor.StreamCreated.IsZero() && !cursor.StreamCreated.Equal(info.Created) {
+		return fmt.Errorf("%w: stream %q was recreated", events.ErrInvalidCursor, cursor.Stream)
+	}
+	return nil
+}
+
+func validateRetention(cursor events.Cursor, info *jetstream.StreamInfo) error {
+	// A captured empty snapshot is a position at sequence zero, not an
+	// instruction to silently start at whichever message remains.
+	if (cursor.AfterSequence != 0 || cursor.Subject != "") && info.State.FirstSeq > 0 &&
+		cursor.AfterSequence < info.State.FirstSeq-1 {
+		return fmt.Errorf("%w: position %d predates first retained sequence %d", events.ErrHistoryExpired, cursor.AfterSequence, info.State.FirstSeq)
+	}
+	return nil
 }
 
 func (a *Adapter) historyStream(ctx context.Context) (jetstream.Stream, error) {
@@ -166,6 +204,16 @@ func validateHistorySubject(subject string) error {
 		if token == "" || (strings.ContainsAny(token, "*>") && token != "*" && token != ">") || (token == ">" && i != len(tokens)-1) {
 			return fmt.Errorf("invalid history subject %q", subject)
 		}
+	}
+	return nil
+}
+
+func validatePublishSubject(subject string) error {
+	if err := validateHistorySubject(subject); err != nil {
+		return err
+	}
+	if strings.ContainsAny(subject, "*>") {
+		return fmt.Errorf("invalid publish subject %q: wildcards are not allowed", subject)
 	}
 	return nil
 }

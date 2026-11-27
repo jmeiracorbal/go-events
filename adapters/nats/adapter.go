@@ -36,6 +36,8 @@ type Adapter struct {
 	subs     map[*subscription]struct{}
 	starting chan struct{}
 	closed   bool
+	closeOnce sync.Once
+	closeErr error
 }
 
 type subscription struct {
@@ -63,18 +65,22 @@ func New(ctx context.Context, cfg Config, options ...natsio.Option) (*Adapter, e
 	if cfg.URL == "" || cfg.Stream == "" {
 		return nil, errors.New("NATS URL and stream are required")
 	}
-	nc, err := natsio.Connect(cfg.URL, options...)
+	nc, err := connectContext(ctx, cfg.URL, options...)
 	if err != nil {
-		return nil, fmt.Errorf("connect NATS: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrConnect, err)
 	}
 	js, err := jetstream.New(nc)
 	if err != nil {
 		nc.Close()
-		return nil, fmt.Errorf("initialize JetStream: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrJetStream, err)
 	}
 	if _, err := js.Stream(ctx, cfg.Stream); err != nil {
 		nc.Close()
-		return nil, fmt.Errorf("find JetStream stream %q: %w", cfg.Stream, err)
+		return nil, fmt.Errorf("%w %q: %w", ErrStreamLookup, cfg.Stream, err)
+	}
+	if err := ctx.Err(); err != nil {
+		nc.Close()
+		return nil, err
 	}
 	return &Adapter{cfg: cfg, conn: nc, js: js, subs: make(map[*subscription]struct{})}, nil
 }
@@ -101,7 +107,13 @@ func (a *Adapter) Publish(ctx context.Context, event events.Event) error {
 		Header:  natsio.Header{},
 	}
 	msg.Header.Set(messageIDHeader, event.ID)
-	ack, err := a.js.PublishMsg(ctx, msg)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := validatePublishSubject(event.Topic); err != nil {
+		return err
+	}
+	ack, err := a.js.PublishMsg(ctx, msg, jetstream.WithExpectStream(a.cfg.Stream))
 	if err != nil {
 		return fmt.Errorf("publish event %q: %w", event.ID, err)
 	}
@@ -120,7 +132,7 @@ func (a *Adapter) Subscribe(ctx context.Context, topic string, handler events.Ha
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := events.ValidateTopic(topic); err != nil {
+	if err := validateHistorySubject(topic); err != nil {
 		return nil, err
 	}
 	if handler == nil {
@@ -162,7 +174,7 @@ func (a *Adapter) Subscribe(ctx context.Context, topic string, handler events.Ha
 			return nil, fmt.Errorf("inspect durable consumer %q: %w", a.cfg.Consumer, err)
 		}
 		if info.Config.Durable != a.cfg.Consumer || info.Config.FilterSubject != topic || info.Config.AckPolicy != jetstream.AckExplicitPolicy || info.Config.DeliverSubject != "" {
-			return nil, fmt.Errorf("durable consumer %q has an incompatible delivery configuration", a.cfg.Consumer)
+			return nil, fmt.Errorf("%w: durable consumer %q", events.ErrConsumerIncompatible, a.cfg.Consumer)
 		}
 	}
 	consume, err := cons.Consume(func(msg jetstream.Msg) {
@@ -170,7 +182,7 @@ func (a *Adapter) Subscribe(ctx context.Context, topic string, handler events.Ha
 		a.processDelivery(ctx, msg, event, fmt.Sprintf("event %q", event.ID), func() error {
 			return handler(ctx, event)
 		})
-	})
+	}, a.consumeErrorHandler())
 	if err != nil {
 		return nil, fmt.Errorf("consume JetStream stream %q: %w", a.cfg.Stream, err)
 	}
@@ -270,6 +282,13 @@ func (a *Adapter) registerSubscription(ctx context.Context, consume jetstream.Co
 	return s, nil
 }
 
+// Both durable subscription modes surface errors reported by the SDK.
+func (a *Adapter) consumeErrorHandler() jetstream.PullConsumeOpt {
+	return jetstream.ConsumeErrHandler(func(_ jetstream.ConsumeContext, err error) {
+		a.report(fmt.Errorf("consume JetStream stream %q: %w", a.cfg.Stream, err))
+	})
+}
+
 func (a *Adapter) report(err error) {
 	if a.cfg.OnError != nil {
 		a.cfg.OnError(err)
@@ -290,29 +309,28 @@ func (s *subscription) Close() error {
 	return s.closeErr
 }
 
+// Close waits for concurrent closure and returns the same cleanup result to
+// every caller. The broker retains durable consumers.
 func (a *Adapter) Close() error {
-	a.mu.Lock()
-	if a.closed {
+	a.closeOnce.Do(func() {
+		a.mu.Lock()
+		a.closed = true
+		starting := a.starting
 		a.mu.Unlock()
-		return nil
-	}
-	a.closed = true
-	starting := a.starting
-	a.mu.Unlock()
-	// Let in-flight setup release its consumer before closing the connection.
-	if starting != nil {
-		<-starting
-	}
-	a.mu.Lock()
-	subs := make([]*subscription, 0, len(a.subs))
-	for sub := range a.subs {
-		subs = append(subs, sub)
-	}
-	a.mu.Unlock()
-	var err error
-	for _, sub := range subs {
-		err = errors.Join(err, sub.Close())
-	}
-	a.conn.Close()
-	return err
+		// Let in-flight setup release its consumer before closing the connection.
+		if starting != nil {
+			<-starting
+		}
+		a.mu.Lock()
+		subs := make([]*subscription, 0, len(a.subs))
+		for sub := range a.subs {
+			subs = append(subs, sub)
+		}
+		a.mu.Unlock()
+		for _, sub := range subs {
+			a.closeErr = errors.Join(a.closeErr, sub.Close())
+		}
+		a.conn.Close()
+	})
+	return a.closeErr
 }

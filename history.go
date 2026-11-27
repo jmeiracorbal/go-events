@@ -32,10 +32,16 @@ type StoredEvent struct {
 // Cursor identifies a stable, stream-scoped historical window. AfterSequence
 // is exclusive. UpperBound is inclusive and fixed on the first Read request.
 // A zero-valued cursor starts at the earliest currently retained message.
+// Read returns a cursor bound to its normalized subject (including ">" for
+// all subjects) and stream creation time. A nonempty Subject identifies a
+// captured snapshot even when UpperBound is zero. Pass the returned cursor
+// unchanged to subsequent reads or replay of the same subject.
 type Cursor struct {
 	Stream        string
 	AfterSequence uint64
 	UpperBound    uint64
+	Subject       string
+	StreamCreated time.Time
 }
 
 // ReadQuery limits the history returned by one call. Subject can be a NATS
@@ -47,7 +53,7 @@ type ReadQuery struct {
 }
 
 // EventPage returns events in ascending stream-sequence order. Next can be
-// used only with the same stream. HasMore applies to the captured historical
+// used only with the same stream and subject. HasMore applies to the captured historical
 // window and does not predict future publishes.
 type EventPage struct {
 	Events  []StoredEvent

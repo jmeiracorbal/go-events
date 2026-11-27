@@ -61,13 +61,10 @@ func (a *Adapter) replay(ctx context.Context, from events.Cursor, subject, durab
 	if a.cfg.AckWait <= 0 || a.cfg.RetryDelay <= 0 {
 		return nil, errors.New("NATS ack wait and retry delay must be configured for replay")
 	}
-	if from.Stream != "" && from.Stream != a.cfg.Stream {
-		return nil, fmt.Errorf("%w: cursor stream %q does not match %q", events.ErrInvalidCursor, from.Stream, a.cfg.Stream)
+	if err := validateCursor(from, a.cfg.Stream, subject); err != nil {
+		return nil, err
 	}
-	if from.Stream == "" && (from.AfterSequence != 0 || from.UpperBound != 0) {
-		return nil, fmt.Errorf("%w: positioned cursor must identify its stream", events.ErrInvalidCursor)
-	}
-	if from.UpperBound != 0 && from.AfterSequence > from.UpperBound {
+	if (from.UpperBound != 0 || from.Subject != "") && from.AfterSequence > from.UpperBound {
 		return nil, fmt.Errorf("%w: position %d exceeds snapshot upper bound %d", events.ErrInvalidCursor, from.AfterSequence, from.UpperBound)
 	}
 	if err := a.reserveSubscription(); err != nil {
@@ -117,9 +114,7 @@ func (a *Adapter) replay(ctx context.Context, from events.Cursor, subject, durab
 		a.processDelivery(ctx, msg, stored.Event,
 			fmt.Sprintf("replay event %q at sequence %d", stored.Event.ID, stored.Sequence),
 			func() error { return handler(ctx, stored) })
-	}, jetstream.PullMaxMessages(replayMaxPendingMessages), jetstream.ConsumeErrHandler(func(_ jetstream.ConsumeContext, err error) {
-		a.report(fmt.Errorf("consume replay stream %q: %w", a.cfg.Stream, err))
-	}))
+	}, jetstream.PullMaxMessages(replayMaxPendingMessages), a.consumeErrorHandler())
 	if err != nil {
 		if cleanup != nil {
 			err = errors.Join(err, cleanup())
@@ -163,17 +158,20 @@ func (a *Adapter) createReplayConsumer(ctx context.Context, from events.Cursor, 
 	if err != nil {
 		return nil, historyError("inspect stream before replay", err)
 	}
+	if err := validateStreamIdentity(from, info); err != nil {
+		return nil, err
+	}
 	if durable == "" && info.Config.Retention != jetstream.LimitsPolicy {
 		return nil, errors.New("ephemeral replay requires limits retention")
 	}
 	if from.AfterSequence > info.State.LastSeq || from.UpperBound > info.State.LastSeq {
 		return nil, fmt.Errorf("%w: cursor is beyond stream last sequence %d", events.ErrInvalidCursor, info.State.LastSeq)
 	}
-	if from.AfterSequence > 0 && info.State.FirstSeq > 0 && from.AfterSequence < info.State.FirstSeq-1 {
-		return nil, fmt.Errorf("%w: position %d predates first retained sequence %d", events.ErrHistoryExpired, from.AfterSequence, info.State.FirstSeq)
+	if err := validateRetention(from, info); err != nil {
+		return nil, err
 	}
 	start := uint64(1)
-	if from.AfterSequence != 0 {
+	if from.AfterSequence != 0 || from.Subject != "" {
 		start = from.AfterSequence + 1
 	} else if info.State.FirstSeq != 0 {
 		start = info.State.FirstSeq
