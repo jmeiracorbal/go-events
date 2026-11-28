@@ -39,7 +39,13 @@ if err != nil {
 defer adapter.Close()
 ```
 
-Use a different durable consumer name for each independent subscriber. Multiple replicas sharing a consumer name share its delivery workload. The NATS adapter does not embed or provision a broker.
+Use a different durable consumer name for each independent subscriber. Multiple replicas sharing a consumer name share its delivery workload. The NATS adapter does not embed or provision a broker. Initial connection honors cancellation and the caller's deadline; a custom dialer or authentication callback must return itself. Synchronous publication requires the configured stream on the server, before storage, and returns success only after its acknowledgement.
+
+### Read-only stream inspection
+
+After connecting with `nats.New`, call `adapter.InspectStream(ctx)` to obtain current stream metadata (subjects, retention, storage, capacity limits, duplicate window, replicas, flags, and retained sequence range). Use `info.CoversSubject("work.>")` to check complete pattern coverage, not merely overlap. Inspection does not create consumers, publish test events or change configuration. Metadata is not evidence of publish or consume permissions; server-side transforms and mirror/source configuration are exposed as flags. Connection, JetStream initialization and stream lookup failures are distinguishable with `nats.ErrConnect`, `nats.ErrJetStream` and `nats.ErrStreamLookup`.
+
+All subscription modes report SDK consumption errors via `Config.OnError`; concurrent adapter closes wait for completion and return the same cleanup result.
 
 ## JetStream history
 
@@ -84,8 +90,12 @@ for {
 
 The first page captures an inclusive `Cursor.UpperBound`; later pages retain
 the same bound even when new events are published. `AfterSequence` is
-exclusive. A cursor with a position must identify its stream, and subsequent
-requests must retain the same subject filter. A zero cursor starts at the
+exclusive. A returned cursor also binds the normalized subject and stream
+creation time, including an empty snapshot at sequence zero. Pass it unchanged
+for subsequent reads or replay of the same subject. History pagination rejects
+positions without complete snapshot identity. Explicit starting positions for
+replay remain a distinct public capability; they do not identify an earlier
+snapshot. A zero cursor starts at the
 earliest retained message. Deleted sequences are skipped, and a saved cursor
 that falls outside the stream retention window returns
 `events.ErrHistoryExpired`. A paginated read is **not** a transactional
@@ -184,7 +194,9 @@ Ephemeral replay requires a stream with Limits retention; otherwise ACK or
 consumer removal could affect the availability of historical messages. Existing
 durable consumers are neither reconfigured nor deleted. Retention can still
 remove history, and events can be redelivered; consumers must handle these
-conditions explicitly. No database or transport-specific state is exposed in
+conditions explicitly. A captured empty snapshot fails replay if its start
+position is no longer retained. Cursor checks detect observed retention loss
+and stream recreation, not arbitrary deletions or a transactional guarantee. No database or transport-specific state is exposed in
 the public interface. Configure `OnError` to observe transport and handler
 errors.
 
